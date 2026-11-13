@@ -5,10 +5,15 @@ import subprocess
 import sys
 import uuid
 from pathlib import Path
-
+import traceback
 import cv2
+import base64
+import binascii
+import re
+from typing import Optional
+import random
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException   
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
@@ -27,9 +32,30 @@ router = APIRouter(prefix="/editor", tags=["Clip Editor"])
 
 BASE_DIR = Path(__file__).resolve().parents[2]
 EDIT_DIR = BASE_DIR / "data" / "edits"
-EDIT_DIR.mkdir(parents=True, exist_ok=True)
+PROJECT_DIR = BASE_DIR
+BACKGROUND_MUSIC_DIR = PROJECT_DIR / "assets" / "audio" / "background_music"
 
+BACKGROUND_MUSIC_DIR = (
+    PROJECT_DIR
+    / "assets"
+    / "audio"
+    / "background_music"
+)
 
+BACKGROUND_MUSIC_DIR.mkdir(
+    parents=True,
+    exist_ok=True,
+)
+class SoundEffectTrack(BaseModel):
+    id: str = Field(min_length=1, max_length=100)
+    name: str = Field(min_length=1, max_length=255)
+    file_name: str = Field(min_length=1, max_length=255)
+    file_data: str = Field(min_length=1)
+
+    start_time: float = Field(ge=0, le=3600)
+    volume: float = Field(default=0.25, ge=0, le=1)
+
+    visual_impact: bool = True
 # =========================================================
 # RENDER SETTINGS
 # =========================================================
@@ -44,7 +70,17 @@ class RenderRequest(BaseModel):
     # Crop
     crop_mode: str = Field(
         default="auto",
-        pattern="^(auto|center|manual|stream_split)$",
+        pattern="^(auto|center|manual|stream_split|gta_split)$",
+    )
+
+    # GTA Gameplay Split
+    gta_gameplay_file_name: str | None = Field(
+        default=None,
+        max_length=255,
+    )
+
+    gta_gameplay_data: str | None = Field(
+        default=None,
     )
 
     manual_x: float = Field(default=0.5, ge=0.0, le=1.0)
@@ -107,14 +143,53 @@ class RenderRequest(BaseModel):
         ge=0.5,
         le=1.5,
     )
-
-    # Sound effects
+    # Sound Effects
     sound_effects: bool = True
 
     sfx_volume: float = Field(
         default=0.25,
         ge=0.0,
         le=1.0,
+    )
+
+    sfx_tracks: list[SoundEffectTrack] = Field(
+        default_factory=list,
+        max_length=20,
+    )
+
+    # Visual Impact FX
+    visual_impact_enabled: bool = True
+
+    impact_intensity: float = Field(
+        default=0.8,
+        ge=0.0,
+        le=1.0,
+    )
+    # Background music
+    bg_music_enabled: bool = False
+
+    bg_music_track: str = Field(
+        default="",
+        max_length=100,
+        pattern=r"^[a-zA-Z0-9_-]*$",
+    )
+
+    bg_music_volume: float = Field(
+        default=0.20,
+        ge=0.0,
+        le=1.0,
+    )
+
+    bg_music_fade_in: float = Field(
+        default=1.5,
+        ge=0.0,
+        le=30.0,
+    )
+
+    bg_music_fade_out: float = Field(
+        default=2.0,
+        ge=0.0,
+        le=30.0,
     )
 
 
@@ -342,12 +417,21 @@ def crop_face_panel(
 # CREATE VERTICAL VIDEO
 # =========================================================
 
-def create_vertical_video(source_path, silent_path, payload):
+
+def create_vertical_video(
+    source_path,
+    silent_path,
+    payload,
+    gameplay_path=None,
+):
     tracking_points = []
+
+    is_gta_split = payload.crop_mode == "gta_split"
 
     needs_tracking = payload.crop_mode in (
         "auto",
         "stream_split",
+        "gta_split",
     )
 
     if needs_tracking:
@@ -363,18 +447,40 @@ def create_vertical_video(source_path, silent_path, payload):
             [],
         )
 
-    if payload.crop_mode == "stream_split" and not tracking_points:
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                "No streamer face was detected. "
-                "Try another clip or use Auto/Center mode."
-            ),
+    if payload.crop_mode in ("stream_split", "gta_split"):
+        if not tracking_points:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "No streamer face was detected. "
+                    "Try another clip or use Auto/Center mode."
+                ),
+            )
+
+    gameplay_capture = None
+
+    if is_gta_split:
+        if not gameplay_path:
+            raise HTTPException(
+                status_code=422,
+                detail="Please upload a GTA gameplay video.",
+            )
+
+        gameplay_capture = cv2.VideoCapture(
+            str(gameplay_path)
         )
+
+        if not gameplay_capture.isOpened():
+            raise RuntimeError(
+                "Could not open GTA gameplay video."
+            )
 
     capture = cv2.VideoCapture(str(source_path))
 
     if not capture.isOpened():
+        if gameplay_capture:
+            gameplay_capture.release()
+
         raise RuntimeError(
             "Could not open downloaded video."
         )
@@ -389,6 +495,10 @@ def create_vertical_video(source_path, silent_path, payload):
 
     if width <= 0 or height <= 0:
         capture.release()
+
+        if gameplay_capture:
+            gameplay_capture.release()
+
         raise RuntimeError(
             "Invalid source video dimensions."
         )
@@ -402,6 +512,10 @@ def create_vertical_video(source_path, silent_path, payload):
 
     if not writer.isOpened():
         capture.release()
+
+        if gameplay_capture:
+            gameplay_capture.release()
+
         raise RuntimeError(
             "Could not initialize video writer."
         )
@@ -417,7 +531,10 @@ def create_vertical_video(source_path, silent_path, payload):
 
             timestamp = frame_index / fps
 
-            if payload.crop_mode == "stream_split":
+            if payload.crop_mode in (
+                "stream_split",
+                "gta_split",
+            ):
                 face = interpolate_tracking(
                     tracking_points,
                     timestamp,
@@ -425,7 +542,8 @@ def create_vertical_video(source_path, silent_path, payload):
 
                 if not face or face.get("width", 0) <= 0:
                     raise RuntimeError(
-                        "Face tracking data is unavailable for this frame."
+                        "Face tracking data is unavailable "
+                        "for this frame."
                     )
 
                 top_height = int(
@@ -442,14 +560,45 @@ def create_vertical_video(source_path, silent_path, payload):
                     payload.face_scale,
                 )
 
-                bottom_panel = crop_panel(
-                    frame,
-                    payload.gameplay_x,
-                    payload.gameplay_y,
-                    1080,
-                    bottom_height,
-                    payload.zoom,
-                )
+                if is_gta_split:
+                    gameplay_success, gameplay_frame = (
+                        gameplay_capture.read()
+                    )
+
+                    # Loop GTA gameplay when it reaches its end.
+                    if not gameplay_success:
+                        gameplay_capture.set(
+                            cv2.CAP_PROP_POS_FRAMES,
+                            0,
+                        )
+
+                        gameplay_success, gameplay_frame = (
+                            gameplay_capture.read()
+                        )
+
+                    if not gameplay_success:
+                        raise RuntimeError(
+                            "Could not read frames from GTA gameplay video."
+                        )
+
+                    bottom_panel = crop_panel(
+                        gameplay_frame,
+                        0.5,
+                        0.5,
+                        1080,
+                        bottom_height,
+                        payload.zoom,
+                    )
+
+                else:
+                    bottom_panel = crop_panel(
+                        frame,
+                        payload.gameplay_x,
+                        payload.gameplay_y,
+                        1080,
+                        bottom_height,
+                        payload.zoom,
+                    )
 
                 output_frame = cv2.vconcat([
                     top_panel,
@@ -493,6 +642,9 @@ def create_vertical_video(source_path, silent_path, payload):
         capture.release()
         writer.release()
 
+        if gameplay_capture:
+            gameplay_capture.release()
+
     if frame_index == 0:
         raise RuntimeError(
             "No frames were processed."
@@ -503,7 +655,6 @@ def create_vertical_video(source_path, silent_path, payload):
         "fps": round(fps, 2),
         "tracking_samples": len(tracking_points),
     }
-
 
 # =========================================================
 # BURN SUBTITLES
@@ -566,7 +717,151 @@ def burn_subtitles(
 
     return output_path
 
+# =========================================================
+# CUSTOM SOUND EFFECTS
+# =========================================================
 
+ALLOWED_SFX_EXTENSIONS = {
+    ".mp3",
+    ".wav",
+    ".m4a",
+    ".aac",
+    ".ogg",
+    ".flac",
+}
+
+
+def save_uploaded_sound_effects(payload, job_dir):
+    saved_tracks = []
+
+    if not payload.sound_effects:
+        return saved_tracks
+
+    total_size = 0
+    max_file_size = 15 * 1024 * 1024
+    max_total_size = 50 * 1024 * 1024
+
+    for index, track in enumerate(payload.sfx_tracks):
+        extension = Path(track.file_name).suffix.lower()
+
+        if extension not in ALLOWED_SFX_EXTENSIONS:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Unsupported audio format: {extension}",
+            )
+
+        safe_name = re.sub(
+            r"[^a-zA-Z0-9_-]",
+            "_",
+            Path(track.file_name).stem,
+        )[:80]
+
+        try:
+            audio_data = base64.b64decode(
+                track.file_data,
+                validate=True,
+            )
+        except (binascii.Error, ValueError):
+            raise HTTPException(
+                status_code=422,
+                detail=f"Invalid audio data for {track.file_name}.",
+            )
+
+        if not audio_data:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Empty audio file: {track.file_name}.",
+            )
+
+        if len(audio_data) > max_file_size:
+            raise HTTPException(
+                status_code=413,
+                detail=f"Audio file is too large: {track.file_name}.",
+            )
+
+        total_size += len(audio_data)
+
+        if total_size > max_total_size:
+            raise HTTPException(
+                status_code=413,
+                detail="Total uploaded sound effects exceed 50 MB.",
+            )
+
+        output_path = (
+            job_dir
+            / f"sfx_{index}_{safe_name}{extension}"
+        )
+
+        output_path.write_bytes(audio_data)
+
+        saved_tracks.append({
+            "id": track.id,
+            "name": track.name,
+            "path": output_path,
+            "start_time": track.start_time,
+            "volume": track.volume,
+            "visual_impact": track.visual_impact,
+        })
+
+    return saved_tracks
+
+ALLOWED_GAMEPLAY_EXTENSIONS = {
+    ".mp4",
+    ".mov",
+    ".mkv",
+    ".webm",
+}
+
+
+def save_gta_gameplay(payload, job_dir):
+    if payload.crop_mode != "gta_split":
+        return None
+
+    if not payload.gta_gameplay_file_name or not payload.gta_gameplay_data:
+        raise HTTPException(
+            status_code=422,
+            detail="Please upload a GTA gameplay video.",
+        )
+
+    extension = Path(
+        payload.gta_gameplay_file_name
+    ).suffix.lower()
+
+    if extension not in ALLOWED_GAMEPLAY_EXTENSIONS:
+        raise HTTPException(
+            status_code=422,
+            detail="Unsupported gameplay video format.",
+        )
+
+    try:
+        video_data = base64.b64decode(
+            payload.gta_gameplay_data,
+            validate=True,
+        )
+    except (binascii.Error, ValueError):
+        raise HTTPException(
+            status_code=422,
+            detail="Invalid GTA gameplay video data.",
+        )
+
+    if not video_data:
+        raise HTTPException(
+            status_code=422,
+            detail="The gameplay video is empty.",
+        )
+
+    max_size = 150 * 1024 * 1024
+
+    if len(video_data) > max_size:
+        raise HTTPException(
+            status_code=413,
+            detail="GTA gameplay video must be smaller than 150 MB.",
+        )
+
+    gameplay_path = job_dir / f"gta_gameplay{extension}"
+    gameplay_path.write_bytes(video_data)
+
+    return gameplay_path
 # =========================================================
 # FINAL AUDIO + VIDEO RENDER
 # =========================================================
@@ -577,82 +872,365 @@ def mux_final_video(
     output_path,
     payload,
     sfx_path=None,
+    duration=None,
+    custom_sfx_tracks=None,
 ):
-    if sfx_path and sfx_path.exists():
-        command = [
-            "ffmpeg",
-            "-y",
-            "-i",
-            str(render_video_path),
-            "-i",
-            str(source_path),
-            "-i",
-            str(sfx_path),
-            "-map",
-            "0:v:0",
-            "-filter_complex",
-            (
-                f"[1:a:0]volume={payload.volume}[base];"
-                f"[2:a:0]volume={payload.sfx_volume}[fx];"
-                "[base][fx]amix=inputs=2:"
-                "duration=first:"
-                "dropout_transition=0[aout]"
-            ),
-            "-map",
-            "[aout]",
-            "-vf",
-            "fps=30",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "medium",
-            "-crf",
-            "20",
-            "-pix_fmt",
-            "yuv420p",
-            "-c:a",
-            "aac",
-            "-b:a",
-            "192k",
-            "-shortest",
-            "-movflags",
-            "+faststart",
-            str(output_path),
-        ]
+    custom_sfx_tracks = custom_sfx_tracks or []
 
+    command = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(render_video_path),
+        "-i",
+        str(source_path),
+    ]
+
+    input_index = 2
+    audio_inputs = []
+
+    # -----------------------------------------------------
+    # Original streamer audio
+    # -----------------------------------------------------
+
+    audio_inputs.append({
+        "index": 1,
+        "label": "base",
+        "filter": f"volume={payload.volume}",
+    })
+
+    # -----------------------------------------------------
+    # Generated caption sound effects
+    # -----------------------------------------------------
+
+    if sfx_path and sfx_path.exists():
+        command.extend(["-i", str(sfx_path)])
+
+        audio_inputs.append({
+            "index": input_index,
+            "label": "caption_sfx",
+            "filter": "volume=1",
+        })
+
+        input_index += 1
+
+    # -----------------------------------------------------
+    # Uploaded custom sound effects
+    # -----------------------------------------------------
+
+    for index, track in enumerate(custom_sfx_tracks):
+        command.extend([
+            "-i",
+            str(track["path"]),
+        ])
+
+        delay_ms = int(track["start_time"] * 1000)
+
+        audio_filter = (
+            f"volume={track['volume']},"
+            f"adelay={delay_ms}|{delay_ms}"
+        )
+
+        audio_inputs.append({
+            "index": input_index,
+            "label": f"custom_sfx_{index}",
+            "filter": audio_filter,
+        })
+
+        input_index += 1
+
+    # -----------------------------------------------------
+    # Background music
+    # -----------------------------------------------------
+
+    if payload.bg_music_enabled:
+        track_name = payload.bg_music_track.strip()
+
+        if not track_name:
+            raise HTTPException(
+                status_code=422,
+                detail="Please select a background music track.",
+            )
+
+        allowed_extensions = (
+            ".mp3",
+            ".wav",
+            ".m4a",
+            ".aac",
+            ".ogg",
+        )
+
+        music_path = None
+
+        for extension in allowed_extensions:
+            candidate = (
+                BACKGROUND_MUSIC_DIR
+                / f"{track_name}{extension}"
+            )
+
+            if candidate.is_file():
+                music_path = candidate
+                break
+
+        if music_path is None:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"Background music '{track_name}' "
+                    "was not found."
+                ),
+            )
+
+        command.extend([
+            "-stream_loop",
+            "-1",
+            "-i",
+            str(music_path),
+        ])
+
+        music_filter = (
+            f"volume={payload.bg_music_volume}"
+        )
+
+        if duration and payload.bg_music_fade_in > 0:
+            fade_in = min(
+                payload.bg_music_fade_in,
+                duration,
+            )
+
+            music_filter += (
+                f",afade=t=in:st=0:d={fade_in}"
+            )
+
+        if duration and payload.bg_music_fade_out > 0:
+            fade_out = min(
+                payload.bg_music_fade_out,
+                duration,
+            )
+
+            fade_start = max(0, duration - fade_out)
+
+            music_filter += (
+                f",afade=t=out:"
+                f"st={fade_start}:"
+                f"d={fade_out}"
+            )
+
+        audio_inputs.append({
+            "index": input_index,
+            "label": "music",
+            "filter": music_filter,
+        })
+
+        input_index += 1
+
+    # -----------------------------------------------------
+    # VIDEO EFFECTS: IMPACT ZOOM + SHAKE + WHITE FLASH
+    # -----------------------------------------------------
+
+    video_filters = []
+    current_video = "0:v"
+
+    visual_tracks = [
+        track
+        for track in custom_sfx_tracks
+        if track.get("visual_impact", False)
+        and (
+            duration is None
+            or track["start_time"] < duration
+        )
+    ]
+
+    intensity = float(payload.impact_intensity or 0)
+
+    effects_enabled = (
+        payload.sound_effects
+        and payload.visual_impact_enabled
+        and duration
+        and intensity > 0
+        and visual_tracks
+    )
+
+    if effects_enabled:
+        pulse_terms = []
+        shake_x_terms = []
+        shake_y_terms = []
+
+        for track in visual_tracks:
+            start = float(track["start_time"])
+
+            center = start + 0.11
+            half_duration = 0.11
+
+            pulse = (
+                f"max(0,1-abs(t-{center:.4f})/"
+                f"{half_duration:.4f})"
+            )
+
+            pulse_terms.append(pulse)
+
+            shake_x_terms.append(
+                f"sin((t-{start:.4f})*110)*({pulse})"
+            )
+
+            shake_y_terms.append(
+                f"cos((t-{start:.4f})*90)*({pulse})"
+            )
+
+        pulse_expression = "+".join(pulse_terms)
+        shake_x_expression = "+".join(shake_x_terms)
+        shake_y_expression = "+".join(shake_y_terms)
+
+        zoom_expression = (
+            f"1+0.055*{intensity:.3f}*"
+            f"min(1,{pulse_expression})"
+        )
+
+        video_filters.append(
+            f"[0:v]"
+            f"scale="
+            f"w='trunc(iw*({zoom_expression})/2)*2':"
+            f"h='trunc(ih*({zoom_expression})/2)*2':"
+            f"eval=frame,"
+            f"crop=1080:1920:"
+            f"x='(iw-1080)/2+"
+            f"7*{intensity:.3f}*({shake_x_expression})':"
+            f"y='(ih-1920)/2+"
+            f"5*{intensity:.3f}*({shake_y_expression})'"
+            f"[impact_zoom]"
+        )
+
+        current_video = "impact_zoom"
+
+
+        # Single Flash Overlay - Fast
+        flash_path = PROJECT_DIR / "assets" / "flash_white.png"
+
+        if not flash_path.is_file():
+            raise HTTPException(
+                status_code=404,
+                detail="Flash overlay image not found.",
+            )
+
+        flash_input_index = input_index
+
+        command.extend([
+            "-loop", "1",
+            "-framerate", "30",
+            "-i", str(flash_path),
+        ])
+
+        flash_intervals = []
+
+        for track in visual_tracks:
+            start = max(0.0, float(track["start_time"]) - 0.015)
+            end = start + 0.180
+
+            flash_intervals.append(
+                f"between(t,{start:.4f},{end:.4f})"
+            )
+
+        flash_enable = "+".join(flash_intervals)
+
+        video_filters.append(
+            f"[{flash_input_index}:v]"
+            f"format=rgba,"
+            f"geq="
+            f"r='r(X,Y)':"  
+            f"g='g(X,Y)':"
+            f"b='b(X,Y)':"
+            f"a='255*0.85*min(1,T/1.05)*"
+            f"min(1,(5.4-T)/3)'"
+            f"[flash_overlay]"
+        )
+        video_filters.append(
+            f"[{current_video}][flash_overlay]"
+            f"overlay=0:0:"
+            f"eof_action=pass:"
+            f"shortest=0:"
+            f"repeatlast=0:"
+            f"enable='{flash_enable}'"
+            f"[flash_result]"
+        )
+
+        current_video = "flash_result"
+   
+    # Always create the final video output
+    video_filters.append(
+        f"[{current_video}]fps=30,format=yuv420p[vout]"
+    )
+
+    # -----------------------------------------------------
+    # Audio filter graph
+    # -----------------------------------------------------
+
+    audio_filters = []
+    mix_labels = []
+
+    for audio in audio_inputs:
+        label = audio["label"]
+
+        audio_filters.append(
+            f"[{audio['index']}:a:0]"
+            f"{audio['filter']}"
+            f"[{label}]"
+        )
+
+        mix_labels.append(f"[{label}]")
+
+    if len(mix_labels) == 1:
+        audio_filters.append(
+            f"{mix_labels[0]}anull[aout]"
+        )
     else:
-        command = [
-            "ffmpeg",
-            "-y",
-            "-i",
-            str(render_video_path),
-            "-i",
-            str(source_path),
-            "-map",
-            "0:v:0",
-            "-map",
-            "1:a?",
-            "-vf",
-            "fps=30",
-            "-af",
-            f"volume={payload.volume}",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "medium",
-            "-crf",
-            "20",
-            "-pix_fmt",
-            "yuv420p",
-            "-c:a",
-            "aac",
-            "-b:a",
-            "192k",
-            "-shortest",
-            "-movflags",
-            "+faststart",
-            str(output_path),
-        ]
+        audio_filters.append(
+            "".join(mix_labels)
+            + f"amix=inputs={len(mix_labels)}:"
+              "duration=first:"
+              "dropout_transition=0:"
+              "normalize=0[aout]"
+        )
+
+    # -----------------------------------------------------
+    # Final FFmpeg command
+    # -----------------------------------------------------
+
+    filter_complex = ";".join(
+        video_filters + audio_filters
+    )
+
+    command.extend([
+        "-filter_complex",
+        filter_complex,
+        "-map",
+        "[vout]",
+        "-map",
+        "[aout]",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "medium",
+        "-crf",
+        "20",
+        "-pix_fmt",
+        "yuv420p",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "192k",
+    ])
+
+    if duration:
+        command.extend([
+            "-t",
+            str(duration),
+        ])
+
+    command.extend([
+        "-movflags",
+        "+faststart",
+        str(output_path),
+    ])
 
     result = subprocess.run(
         command,
@@ -664,15 +1242,15 @@ def mux_final_video(
     if result.returncode != 0 or not output_path.exists():
         raise RuntimeError(
             "FFmpeg rendering failed: "
-            + result.stderr[-2500:]
+            + result.stderr[-3500:]
         )
 
     return output_path
 
-
 # =========================================================
 # RENDER ENDPOINT
 # =========================================================
+
 
 @router.post("/render")
 def render_clip(
@@ -714,7 +1292,19 @@ def render_clip(
     )
 
     try:
-        # 1. Download original clip
+        # 1. Save uploaded sound effects
+        custom_sfx_tracks = save_uploaded_sound_effects(
+            payload,
+            job_dir,
+        )
+
+        # 2. Save GTA gameplay if GTA Split is selected
+        gameplay_path = save_gta_gameplay(
+            payload,
+            job_dir,
+        )
+
+        # 3. Download original clip
         source_path = download_clip(
             clip.url,
             job_dir,
@@ -727,14 +1317,15 @@ def render_clip(
             / f"trendhunter_{clip.id}_{job_id}.mp4"
         )
 
-        # 2. Crop and convert to vertical format
+        # 4. Crop and convert to vertical format
         processing = create_vertical_video(
             source_path,
             silent_path,
             payload,
+            gameplay_path=gameplay_path,
         )
 
-        # 3. Transcription
+        # 5. Transcription
         transcription = {
             "language": "en",
             "text": "",
@@ -756,14 +1347,12 @@ def render_clip(
                 source_path
             )
 
-        # 4. Generate and burn subtitles
+        # 6. Generate and burn subtitles
         if (
             payload.subtitles_enabled
             and transcription.get("words")
         ):
-            subtitle_path = (
-                job_dir / "subtitles.ass"
-            )
+            subtitle_path = job_dir / "subtitles.ass"
 
             subtitled_path = (
                 job_dir / "vertical_subtitled.mp4"
@@ -799,7 +1388,7 @@ def render_clip(
 
             render_video_path = subtitled_path
 
-        # 5. Generate sound effects
+        # 7. Generate caption sound effects
         if (
             payload.sound_effects
             and transcription.get("words")
@@ -819,13 +1408,20 @@ def render_clip(
                 intensity=payload.animation_intensity,
             )
 
-        # 6. Final FFmpeg render
+        # 8. Final FFmpeg render
+        video_duration = (
+            processing["frames_processed"]
+            / processing["fps"]
+        )
+
         mux_final_video(
             render_video_path,
             source_path,
             output_path,
             payload,
             sfx_path=sfx_path,
+            duration=video_duration,
+            custom_sfx_tracks=custom_sfx_tracks,
         )
 
         applied_mode = payload.crop_mode
@@ -836,7 +1432,7 @@ def render_clip(
         ):
             applied_mode = "center_fallback"
 
-        # 7. Response
+        # 9. Response
         return {
             "status": "completed",
             "clip_id": clip.id,
@@ -849,16 +1445,25 @@ def render_clip(
             "tracking_samples": processing["tracking_samples"],
             "frames_processed": processing["frames_processed"],
             "fps": processing["fps"],
+
             "split_ratio": (
                 payload.split_ratio
-                if payload.crop_mode == "stream_split"
+                if payload.crop_mode in (
+                    "stream_split",
+                    "gta_split",
+                )
                 else None
             ),
+
             "face_scale": (
                 payload.face_scale
-                if payload.crop_mode == "stream_split"
+                if payload.crop_mode in (
+                    "stream_split",
+                    "gta_split",
+                )
                 else None
             ),
+
             "subtitles": {
                 "enabled": bool(subtitle_info),
                 "style": "Rubik",
@@ -875,23 +1480,59 @@ def render_clip(
                 "display_mode": payload.caption_display_mode,
                 "position": payload.caption_position,
                 "animation": payload.caption_animation,
+
                 "sound_effects": bool(
                     sfx_path and sfx_path.exists()
                 ),
+
                 "language": transcription.get(
                     "language",
                     "en",
                 ),
+
                 "text": transcription.get("text", ""),
+
                 "word_count": transcription.get(
                     "word_count",
                     0,
                 ),
+
                 "caption_groups": (
                     subtitle_info["caption_groups"]
                     if subtitle_info
                     else 0
                 ),
+            },
+
+            "audio": {
+                "background_music": {
+                    "enabled": payload.bg_music_enabled,
+                    "track": payload.bg_music_track,
+                    "volume": payload.bg_music_volume,
+                },
+
+                "sound_effects": {
+                    "enabled": payload.sound_effects,
+                    "count": len(custom_sfx_tracks),
+
+                    "tracks": [
+                        {
+                            "name": track["name"],
+                            "start_time": track["start_time"],
+                            "volume": track["volume"],
+                            "visual_impact": track["visual_impact"],
+                        }
+                        for track in custom_sfx_tracks
+                    ],
+                },
+
+                "visual_impact": {
+                    "enabled": (
+                        payload.sound_effects
+                        and payload.visual_impact_enabled
+                    ),
+                    "intensity": payload.impact_intensity,
+                },
             },
         }
 
@@ -905,11 +1546,18 @@ def render_clip(
         raise
 
     except Exception as exc:
+        print("\n" + "=" * 80)
+        print("TREND HUNTER RENDER ERROR")
+        print("=" * 80)
+
+        traceback.print_exc()
+
+        print("=" * 80 + "\n")
+
         raise HTTPException(
             status_code=500,
             detail=f"Video editing failed: {str(exc)}",
         ) from exc
-
 
 # =========================================================
 # DOWNLOAD ENDPOINT

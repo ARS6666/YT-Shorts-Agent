@@ -199,7 +199,32 @@ def get_clips(
         Clip.viral_score.desc()
     ).limit(limit).all()
 
+@app.delete("/clips/reset")
+def reset_clips(db: Session = Depends(get_db)):
+    try:
+        deleted_snapshots = db.query(ClipMetricSnapshot).delete(
+            synchronize_session=False
+        )
 
+        deleted_clips = db.query(Clip).delete(
+            synchronize_session=False
+        )
+
+        db.commit()
+
+        return {
+            "success": True,
+            "message": "Clip list has been reset successfully.",
+            "deleted_clips": deleted_clips,
+            "deleted_snapshots": deleted_snapshots,
+        }
+
+    except Exception:
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to reset clip list."
+        )
 @app.get(
     "/clips/{clip_id}",
     response_model=ClipResponse

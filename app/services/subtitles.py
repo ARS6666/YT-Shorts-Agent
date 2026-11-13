@@ -1,3 +1,4 @@
+
 import math
 import random
 import re
@@ -63,26 +64,20 @@ KEYWORD_RULES = {
 
 # ---------------------------------------------------------
 # OUTLINE PRESETS
+# The selected caption color is always preserved.
+# These presets control the outline color only.
 # ---------------------------------------------------------
 
 OUTLINE_PRESETS = {
-    # White text with black outline
     "white_black": {
-        "primary": "&H00FFFFFF&",
         "outline_color": "&H00000000&",
         "outline": 5,
     },
-
-    # Black text with white outline
     "black_white": {
-        "primary": "&H00000000&",
         "outline_color": "&H00FFFFFF&",
         "outline": 5,
     },
-
-    # Use the selected caption color with black outline
     "color_black": {
-        "primary": None,
         "outline_color": "&H00000000&",
         "outline": 5,
     },
@@ -96,19 +91,19 @@ OUTLINE_PRESETS = {
 SHADOW_PRESETS = {
     "none": {
         "shadow": 0,
-        "blur": 0,
+        "glow": False,
     },
     "soft": {
         "shadow": 1,
-        "blur": 1,
+        "glow": False,
     },
     "strong": {
         "shadow": 3,
-        "blur": 0,
+        "glow": False,
     },
     "glow": {
-        "shadow": 2,
-        "blur": 4,
+        "shadow": 0,
+        "glow": True,
     },
 }
 
@@ -120,10 +115,11 @@ SHADOW_PRESETS = {
 def ass_time(seconds):
     seconds = max(0.0, float(seconds))
 
-    hours = int(seconds // 3600)
-    minutes = int((seconds % 3600) // 60)
-    whole_seconds = int(seconds % 60)
-    centiseconds = int((seconds - int(seconds)) * 100)
+    total_cs = int(round(seconds * 100))
+    hours = total_cs // 360000
+    minutes = (total_cs // 6000) % 60
+    centiseconds = total_cs % 100
+    whole_seconds = (total_cs // 100) % 60
 
     return (
         f"{hours}:{minutes:02d}:"
@@ -270,11 +266,11 @@ def resolve_outline(outline_preset, color_preset):
         OUTLINE_PRESETS["white_black"],
     ).copy()
 
-    if settings["primary"] is None:
-        settings["primary"] = CAPTION_COLOR_PRESETS.get(
-            color_preset,
-            CAPTION_COLOR_PRESETS["mrbeast"],
-        )
+    # Always use the selected caption color.
+    settings["primary"] = CAPTION_COLOR_PRESETS.get(
+        color_preset,
+        CAPTION_COLOR_PRESETS["mrbeast"],
+    )
 
     return settings
 
@@ -283,7 +279,18 @@ def resolve_shadow(shadow_preset):
     return SHADOW_PRESETS.get(
         shadow_preset,
         SHADOW_PRESETS["strong"],
-    )
+    ).copy()
+
+
+def make_transparent_color(color, alpha="60"):
+    """
+    ASS color format: &HAABBGGRR&
+    Higher alpha means more transparent.
+    """
+    if not color.startswith("&H"):
+        return color
+
+    return f"&H{alpha}{color[2:]}"
 
 
 # ---------------------------------------------------------
@@ -314,11 +321,9 @@ def generate_ass_subtitles(
 
     font_size = resolve_font_size(font_size)
 
-    # Validate display mode
     if display_mode not in ("word", "phrase"):
         display_mode = "word"
 
-    # Validate animation
     if animation not in (
         "pop_bounce",
         "pop",
@@ -327,7 +332,6 @@ def generate_ass_subtitles(
     ):
         animation = "pop_bounce"
 
-    # Resolve outline and shadow
     outline_settings = resolve_outline(
         outline_preset,
         color_preset,
@@ -338,8 +342,9 @@ def generate_ass_subtitles(
     primary_color = outline_settings["primary"]
     outline_color = outline_settings["outline_color"]
     outline_width = outline_settings["outline"]
+
     shadow_width = shadow_settings["shadow"]
-    shadow_blur = shadow_settings["blur"]
+    glow_enabled = shadow_settings["glow"]
 
     bold_value = -1 if bold else 0
 
@@ -362,7 +367,6 @@ def generate_ass_subtitles(
         exist_ok=True,
     )
 
-    # Base ASS style
     header = f"""[Script Info]
 Title: TrendHunter Animated Captions
 ScriptType: v4.00+
@@ -395,20 +399,21 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             caption_parts = []
 
             for index, word in enumerate(group):
-                original_text = str(word.get("text", "")).strip()
+                original_text = str(
+                    word.get("text", "")
+                ).strip()
 
                 if not original_text:
                     continue
 
                 text = escape_ass_text(original_text)
+
                 emoji, keyword_color = get_keyword_style(
                     group,
                     index,
                 )
 
-                # Active word
                 if index == active_index:
-                    # Keyword highlight takes priority when an emoji exists.
                     active_color = (
                         keyword_color if emoji else primary_color
                     )
@@ -430,9 +435,6 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                         f"\\shad{shadow_width}"
                     )
 
-                    if shadow_blur > 0:
-                        active_tags += f"\\blur{shadow_blur}"
-
                     active_tags += "}"
 
                     caption_parts.append(
@@ -442,7 +444,6 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                         + "{\\rDefault}"
                     )
 
-                    # Add emoji for recognized keywords
                     if emoji:
                         caption_parts.append(
                             f"{{\\fnSegoe UI Emoji"
@@ -452,7 +453,6 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                             f"{{\\rDefault}}"
                         )
 
-                # Inactive words in phrase mode
                 else:
                     caption_parts.append(
                         f"{{\\c{primary_color}"
@@ -478,10 +478,46 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 + caption
             )
 
+            event_start = ass_time(start)
+            event_end = ass_time(end + 0.08)
+
+            # Glow layer: a wider, blurred, transparent copy.
+            if glow_enabled:
+                glow_color = make_transparent_color(
+                    primary_color,
+                    alpha="65",
+                )
+
+                glow_caption = caption.replace(
+                    f"\\3c{outline_color}",
+                    f"\\3c{glow_color}",
+                )
+
+                glow_caption = glow_caption.replace(
+                    f"\\bord{outline_width}",
+                    f"\\bord{outline_width + 9}",
+                )
+
+                glow_caption = glow_caption.replace(
+                    "\\shad0",
+                    "\\shad0\\blur5",
+                )
+
+                events.append(
+                    "Dialogue: 0,"
+                    f"{event_start},"
+                    f"{event_end},"
+                    f"Default,,0,0,0,,{glow_caption}"
+                )
+
+                normal_layer = 1
+            else:
+                normal_layer = 0
+
             events.append(
-                "Dialogue: 0,"
-                f"{ass_time(start)},"
-                f"{ass_time(end + 0.08)},"
+                f"Dialogue: {normal_layer},"
+                f"{event_start},"
+                f"{event_end},"
                 f"Default,,0,0,0,,{caption}"
             )
 
@@ -579,12 +615,14 @@ def generate_sfx_track(
                 break
 
             t = sample_index / sample_rate
+
             progress = sample_index / max(
                 1,
                 effect_samples,
             )
 
             envelope = math.exp(-progress * 7)
+
             tone = math.sin(
                 2 * math.pi * frequency * t
             )

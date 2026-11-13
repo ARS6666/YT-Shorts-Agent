@@ -21,6 +21,7 @@ import {
   Scissors,
   Download,
   SlidersHorizontal,
+  Zap,
 } from "lucide-react";
 import "./App.css";
 
@@ -317,6 +318,7 @@ function ClipLibrary({
   onStatusChange,
   collectionSummary,
   analytics,
+  onReset,
 }) {
   const [selectedClip, setSelectedClip] = useState(null);
   const [search, setSearch] = useState("");
@@ -368,7 +370,6 @@ function ClipLibrary({
           </h1>
           <p>Discover, preview and manage clips collected from Twitch.</p>
         </div>
-
         <div className="heading-actions">
           <button
             className="secondary-button"
@@ -377,6 +378,15 @@ function ClipLibrary({
           >
             <RefreshCw size={16} className={loading ? "spin" : ""} />
             Refresh clips
+          </button>
+
+          <button
+            className="secondary-button"
+            onClick={onReset}
+            disabled={loading || collecting}
+          >
+            <Trash2 size={16} />
+            Reset Clip List
           </button>
 
           <button
@@ -753,6 +763,10 @@ function EditorPage({ clips, setError }) {
   const [gameplayX, setGameplayX] = useState(0.5);
   const [gameplayY, setGameplayY] = useState(0.5);
 
+  // GTA Gameplay Split
+  const [gtaGameplayFile, setGtaGameplayFile] = useState(null);
+  const [gtaGameplayUrl, setGtaGameplayUrl] = useState("");
+
   // Subtitle settings
   const [subtitlesEnabled, setSubtitlesEnabled] = useState(true);
   const [captionDisplayMode, setCaptionDisplayMode] = useState("word");
@@ -766,9 +780,20 @@ function EditorPage({ clips, setError }) {
   const [captionOutline, setCaptionOutline] = useState("white_black");
   const [captionShadow, setCaptionShadow] = useState("strong");
 
-  // Sound effects
+  // Background Music
+  const [bgMusicEnabled, setBgMusicEnabled] = useState(true);
+  const [bgMusicTrack, setBgMusicTrack] = useState("bedtime_baby_lullabies");
+  const [bgMusicVolume, setBgMusicVolume] = useState(0.08);
+  const [bgMusicFadeIn, setBgMusicFadeIn] = useState(2);
+  const [bgMusicFadeOut, setBgMusicFadeOut] = useState(3);
+
+  // Sound Effects
   const [soundEffects, setSoundEffects] = useState(true);
-  const [sfxVolume, setSfxVolume] = useState(0.25);
+  const [soundEffectTracks, setSoundEffectTracks] = useState([]);
+  const [newSfxTime, setNewSfxTime] = useState("00:00.000");
+  const [newSfxVolume, setNewSfxVolume] = useState(0.25);
+  const [sfxError, setSfxError] = useState("");
+  const [impactIntensity, setImpactIntensity] = useState(0.8);
 
   const [rendering, setRendering] = useState(false);
   const [result, setResult] = useState(null);
@@ -816,26 +841,155 @@ function EditorPage({ clips, setError }) {
     (clip) => String(clip.id) === String(selectedClipId),
   );
 
+  function parseSfxTime(value) {
+    const match = value.match(/^(\d{2}):([0-5]\d)\.(\d{3})$/);
+
+    if (!match) return null;
+
+    const minutes = Number(match[1]);
+    const seconds = Number(match[2]);
+    const milliseconds = Number(match[3]);
+
+    return minutes * 60 + seconds + milliseconds / 1000;
+  }
+
+  function addSoundEffects(event) {
+    const files = Array.from(event.target.files || []);
+
+    if (!files.length) return;
+
+    const audioFiles = files.filter((file) => file.type.startsWith("audio/"));
+
+    if (!audioFiles.length) {
+      setSfxError("Please select valid audio files.");
+      event.target.value = "";
+      return;
+    }
+
+    const newTracks = audioFiles.map((file) => ({
+      id: `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+      name: file.name,
+      file,
+      url: URL.createObjectURL(file),
+      startTime: newSfxTime,
+      volume: newSfxVolume,
+      visualImpact: true,
+    }));
+
+    setSoundEffectTracks((previous) => [...previous, ...newTracks]);
+    setSfxError("");
+    setSoundEffects(true);
+
+    event.target.value = "";
+  }
+
+  function removeSoundEffect(id) {
+    setSoundEffectTracks((previous) => {
+      const track = previous.find((item) => item.id === id);
+
+      if (track?.url) {
+        URL.revokeObjectURL(track.url);
+      }
+
+      return previous.filter((item) => item.id !== id);
+    });
+  }
+
+  function updateSoundEffect(id, field, value) {
+    setSoundEffectTracks((previous) =>
+      previous.map((track) =>
+        track.id === id ? { ...track, [field]: value } : track,
+      ),
+    );
+  }
+  function fileToBase64(file) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+
+      reader.onload = () => {
+        const result = reader.result;
+
+        if (typeof result !== "string") {
+          reject(new Error("Could not read audio file."));
+          return;
+        }
+
+        resolve(result.split(",")[1]);
+      };
+
+      reader.onerror = () => reject(new Error("Failed to read audio file."));
+      reader.readAsDataURL(file);
+    });
+  }
+
+  async function prepareSoundEffectTracks() {
+    return Promise.all(
+      soundEffectTracks.map(async (track) => {
+        const startTime = parseSfxTime(track.startTime);
+
+        if (startTime === null) {
+          throw new Error(`Invalid start time for "${track.name}".`);
+        }
+
+        return {
+          id: track.id,
+          name: track.name,
+          file_name: track.file.name,
+          file_data: await fileToBase64(track.file),
+          start_time: startTime,
+          volume: Number(track.volume),
+          visual_impact: Boolean(track.visualImpact),
+        };
+      }),
+    );
+  }
   async function renderVideo() {
     if (!selectedClip) {
       setError("Please select a Twitch clip first.");
       return;
     }
 
+    if (soundEffects && soundEffectTracks.length > 0) {
+      const invalidTrack = soundEffectTracks.find(
+        (track) => parseSfxTime(track.startTime) === null,
+      );
+
+      if (invalidTrack) {
+        setError(`Invalid start time for "${invalidTrack.name}".`);
+        return;
+      }
+    }
+
+    if (cropMode === "gta_split" && !gtaGameplayFile) {
+      setError("Please upload a GTA gameplay video.");
+      setRendering(false);
+      return;
+    }
+
+    const gtaGameplayData =
+      cropMode === "gta_split" ? await fileToBase64(gtaGameplayFile) : null;
+
     setRendering(true);
     setResult(null);
     setError("");
 
     try {
+      const preparedTracks =
+        soundEffects && soundEffectTracks.length > 0
+          ? await prepareSoundEffectTracks()
+          : [];
+
       const data = await request(`${API}/editor/render`, {
         method: "POST",
         body: JSON.stringify({
           clip_id: Number(selectedClip.id),
+
           crop_mode: cropMode,
           zoom: Number(zoom),
           volume: Number(volume),
           manual_x: Number(manualX),
           manual_y: Number(manualY),
+
           split_ratio: Number(splitRatio),
           face_scale: Number(faceScale),
           gameplay_x: Number(gameplayX),
@@ -853,8 +1007,25 @@ function EditorPage({ clips, setError }) {
           caption_outline: captionOutline,
           caption_shadow: captionShadow,
 
+          gta_gameplay_data: gtaGameplayData,
+          gta_gameplay_file_name: gtaGameplayFile?.name || null,
+          // Background Music
+          bg_music_enabled: bgMusicEnabled,
+          bg_music_track: bgMusicTrack,
+          bg_music_volume: Number(bgMusicVolume),
+          bg_music_fade_in: Number(bgMusicFadeIn),
+          bg_music_fade_out: Number(bgMusicFadeOut),
+
+          // Sound Effects
           sound_effects: soundEffects,
-          sfx_volume: Number(sfxVolume),
+          sfx_volume: Number(newSfxVolume),
+          sfx_tracks: preparedTracks,
+
+          // Visual Impact FX
+          visual_impact_enabled: preparedTracks.some(
+            (track) => track.visual_impact,
+          ),
+          impact_intensity: Number(impactIntensity),
         }),
       });
 
@@ -865,13 +1036,12 @@ function EditorPage({ clips, setError }) {
       setRendering(false);
     }
   }
-
   const downloadUrl = result?.download_url
     ? `${API}${result.download_url}`
     : "";
 
   return (
-    <section className="page-content">
+    <section className="page-content editor-page">
       <div className="page-heading">
         <div>
           <span className="eyebrow">
@@ -888,6 +1058,7 @@ function EditorPage({ clips, setError }) {
       </div>
 
       <div className="editor-layout">
+        {/* EDITOR SETTINGS */}
         <div className="editor-settings">
           <div className="editor-section-heading">
             <div>
@@ -942,6 +1113,7 @@ function EditorPage({ clips, setError }) {
 
           <div className="editor-divider" />
 
+          {/* FRAMING */}
           <div className="editor-section-heading">
             <div>
               <span className="eyebrow">02 / FRAMING</span>
@@ -971,7 +1143,15 @@ function EditorPage({ clips, setError }) {
               <strong>Streamer Split</strong>
               <small>Camera + Gameplay</small>
             </button>
-
+            <button
+              type="button"
+              className={cropMode === "gta_split" ? "selected" : ""}
+              onClick={() => setCropMode("gta_split")}
+            >
+              <Clapperboard size={20} />
+              <strong>GTA Split</strong>
+              <small>Streamer + GTA gameplay</small>
+            </button>
             <button
               type="button"
               className={cropMode === "center" ? "selected" : ""}
@@ -1118,8 +1298,111 @@ function EditorPage({ clips, setError }) {
             </div>
           )}
 
+          {cropMode === "gta_split" && (
+            <div className="split-controls">
+              <div className="editor-info">
+                <Clapperboard size={18} />
+                <span>
+                  Upload a GTA gameplay video. The streamer stays in the top
+                  panel and GTA gameplay plays below.
+                </span>
+              </div>
+
+              <label className="editor-label">GTA Gameplay Video</label>
+
+              <input
+                className="editor-select"
+                type="file"
+                accept="video/*"
+                onChange={(event) => {
+                  const file = event.target.files?.[0];
+
+                  if (!file) return;
+
+                  if (gtaGameplayUrl) {
+                    URL.revokeObjectURL(gtaGameplayUrl);
+                  }
+
+                  setGtaGameplayFile(file);
+                  setGtaGameplayUrl(URL.createObjectURL(file));
+                  setResult(null);
+                }}
+              />
+
+              {gtaGameplayUrl && (
+                <div className="editor-source-card">
+                  <video
+                    src={gtaGameplayUrl}
+                    controls
+                    muted
+                    playsInline
+                    style={{
+                      width: "100%",
+                      maxHeight: "180px",
+                      objectFit: "cover",
+                    }}
+                  />
+
+                  <div>
+                    <strong>{gtaGameplayFile?.name}</strong>
+                    <span>GTA gameplay selected</span>
+                  </div>
+                </div>
+              )}
+
+              <div className="split-layout-demo">
+                <div className="split-camera-demo">
+                  <span>STREAMER CAMERA</span>
+                </div>
+                <div className="split-game-demo">
+                  <span>GTA GAMEPLAY</span>
+                </div>
+              </div>
+
+              <div className="editor-range-header">
+                <label>Camera panel height</label>
+                <strong>{Math.round(splitRatio * 100)}%</strong>
+              </div>
+
+              <input
+                className="editor-range"
+                type="range"
+                min="0.35"
+                max="0.65"
+                step="0.01"
+                value={splitRatio}
+                onChange={(event) => setSplitRatio(Number(event.target.value))}
+              />
+
+              <div className="editor-range-header">
+                <label>Face size</label>
+                <strong>{Number(faceScale).toFixed(1)}x</strong>
+              </div>
+
+              <input
+                className="editor-range"
+                type="range"
+                min="2"
+                max="6"
+                step="0.1"
+                value={faceScale}
+                onChange={(event) => setFaceScale(Number(event.target.value))}
+              />
+
+              <div className="editor-info">
+                <Activity size={17} />
+                <span>
+                  GTA gameplay loops automatically if it is shorter than the
+                  streamer clip. Its original audio is not included in the final
+                  video.
+                </span>
+              </div>
+            </div>
+          )}
+
           <div className="editor-divider" />
 
+          {/* VIDEO ENHANCEMENT */}
           <div className="editor-section-heading">
             <div>
               <span className="eyebrow">03 / ENHANCEMENT</span>
@@ -1158,6 +1441,8 @@ function EditorPage({ clips, setError }) {
           />
 
           <div className="editor-divider" />
+
+          {/* SUBTITLES */}
           <div className="editor-section-heading">
             <div>
               <span className="eyebrow">04 / CAPTIONS</span>
@@ -1363,47 +1648,15 @@ function EditorPage({ clips, setError }) {
                 </div>
 
                 <div className="editor-divider" />
-
-                <label className="caption-toggle-row">
-                  <span>
-                    <strong>Sound effects</strong>
-                    <small>Pop and whoosh synchronized with captions.</small>
-                  </span>
-
-                  <input
-                    type="checkbox"
-                    checked={soundEffects}
-                    onChange={(event) => setSoundEffects(event.target.checked)}
-                  />
-                </label>
-
-                {soundEffects && (
-                  <>
-                    <div className="editor-range-header">
-                      <label>Sound effect volume</label>
-                      <strong>{Math.round(sfxVolume * 100)}%</strong>
-                    </div>
-
-                    <input
-                      className="editor-range"
-                      type="range"
-                      min="0"
-                      max="1"
-                      step="0.05"
-                      value={sfxVolume}
-                      onChange={(event) =>
-                        setSfxVolume(Number(event.target.value))
-                      }
-                    />
-                  </>
-                )}
               </>
             )}
           </div>
+
+          {/* CAPTION STYLE */}
           <div className="caption-style-section">
             <div className="caption-control-heading">
               <span>Text Outline</span>
-              <small>outlins style</small>
+              <small>Outline style</small>
             </div>
 
             <div className="caption-style-grid">
@@ -1432,15 +1685,15 @@ function EditorPage({ clips, setError }) {
 
             <div className="caption-control-heading">
               <span>Text Shadow</span>
-              <small>shadow density</small>
+              <small>Shadow density</small>
             </div>
 
             <div className="caption-shadow-options">
               {[
-                { value: "none", label: "none" },
-                { value: "soft", label: "soft" },
-                { value: "strong", label: "strong" },
-                { value: "glow", label: "glow" },
+                { value: "none", label: "None" },
+                { value: "soft", label: "Soft" },
+                { value: "strong", label: "Strong" },
+                { value: "glow", label: "Glow" },
               ].map((option) => (
                 <button
                   type="button"
@@ -1456,6 +1709,443 @@ function EditorPage({ clips, setError }) {
             </div>
           </div>
 
+          {/* AUDIO STUDIO - INDEPENDENT FROM SUBTITLES */}
+          <div className="editor-divider" />
+
+          <div className="audio-studio">
+            <div className="audio-studio-heading">
+              <div>
+                <span className="eyebrow">05 / AUDIO PRODUCTION</span>
+                <h3>Audio Studio</h3>
+                <p>Manage music, sound effects and audio levels.</p>
+              </div>
+              <span className="audio-studio-icon">
+                <Activity size={21} />
+              </span>
+            </div>
+
+            {/* BACKGROUND MUSIC */}
+            <div className="audio-layer-card">
+              <div className="audio-layer-header">
+                <div className="audio-layer-title">
+                  <span className="audio-layer-number">01</span>
+                  <div>
+                    <strong>Background Music</strong>
+                    <small>Independent background music layer</small>
+                  </div>
+                </div>
+
+                <label className="audio-switch">
+                  <input
+                    type="checkbox"
+                    checked={bgMusicEnabled}
+                    onChange={(event) =>
+                      setBgMusicEnabled(event.target.checked)
+                    }
+                  />
+                  <span />
+                </label>
+              </div>
+
+              <div
+                className={`audio-layer-content ${!bgMusicEnabled ? "disabled" : ""}`}
+              >
+                <label className="editor-label">Music track</label>
+
+                <select
+                  className="editor-select"
+                  value={bgMusicTrack}
+                  onChange={(event) => setBgMusicTrack(event.target.value)}
+                  disabled={!bgMusicEnabled}
+                >
+                  <option value="bedtime_baby_lullabies">
+                    Ts Pmo — Bedtime Baby Lullabies
+                  </option>
+                </select>
+
+                <div className="audio-track-info">
+                  <div className="audio-track-art">
+                    <Activity size={22} />
+                  </div>
+                  <div className="audio-track-details">
+                    <strong>Bedtime Baby Lullabies</strong>
+                    <small>Selected background track</small>
+                  </div>
+                  <span className="audio-track-status">
+                    {bgMusicEnabled ? "ACTIVE" : "OFF"}
+                  </span>
+                </div>
+
+                <div className="audio-control">
+                  <div className="editor-range-header">
+                    <label>Music volume</label>
+                    <strong>{Math.round(bgMusicVolume * 100)}%</strong>
+                  </div>
+
+                  <input
+                    className="editor-range"
+                    type="range"
+                    min="0"
+                    max="0.5"
+                    step="0.01"
+                    value={bgMusicVolume}
+                    disabled={!bgMusicEnabled}
+                    onChange={(event) =>
+                      setBgMusicVolume(Number(event.target.value))
+                    }
+                  />
+                </div>
+
+                <div className="audio-fade-grid">
+                  <div>
+                    <label className="editor-label">Fade In</label>
+                    <div className="audio-number-input">
+                      <input
+                        type="number"
+                        min="0"
+                        max="15"
+                        step="0.5"
+                        value={bgMusicFadeIn}
+                        disabled={!bgMusicEnabled}
+                        onChange={(event) =>
+                          setBgMusicFadeIn(Number(event.target.value))
+                        }
+                      />
+                      <span>sec</span>
+                    </div>
+                  </div>
+
+                  <div>
+                    <label className="editor-label">Fade Out</label>
+                    <div className="audio-number-input">
+                      <input
+                        type="number"
+                        min="0"
+                        max="30"
+                        step="0.5"
+                        value={bgMusicFadeOut}
+                        disabled={!bgMusicEnabled}
+                        onChange={(event) =>
+                          setBgMusicFadeOut(Number(event.target.value))
+                        }
+                      />
+                      <span>sec</span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {/* STREAMER AUDIO */}
+            <div className="audio-layer-card audio-original-layer">
+              <div className="audio-layer-header">
+                <div className="audio-layer-title">
+                  <span className="audio-layer-number">02</span>
+                  <div>
+                    <strong>Streamer Audio</strong>
+                    <small>Original audio from the source clip</small>
+                  </div>
+                </div>
+                <span className="audio-original-badge">ORIGINAL</span>
+              </div>
+
+              <div className="audio-original-info">
+                <Activity size={18} />
+                <span>
+                  Original streamer audio remains independent. Disabling
+                  background music will never mute the source audio.
+                </span>
+              </div>
+            </div>
+
+            {/* SOUND EFFECTS */}
+            <div className="audio-layer-card">
+              <div className="audio-layer-header">
+                <div className="audio-layer-title">
+                  <span className="audio-layer-number">03</span>
+                  <div>
+                    <strong>Sound Effects</strong>
+                    <small>
+                      Multiple effects with individual timing and volume
+                    </small>
+                  </div>
+                </div>
+
+                <label className="audio-switch">
+                  <input
+                    type="checkbox"
+                    checked={soundEffects}
+                    onChange={(event) => setSoundEffects(event.target.checked)}
+                  />
+                  <span />
+                </label>
+              </div>
+
+              {soundEffects && (
+                <div className="audio-layer-content">
+                  <div className="sfx-upload-area">
+                    <input
+                      id="sfx-upload-input"
+                      type="file"
+                      accept="audio/*"
+                      multiple
+                      onChange={addSoundEffects}
+                    />
+
+                    <label htmlFor="sfx-upload-input">
+                      <span className="sfx-upload-icon">
+                        <Plus size={23} />
+                      </span>
+                      <strong>Add sound effects</strong>
+                      <small>Upload MP3, WAV, M4A or other audio files</small>
+                    </label>
+                  </div>
+
+                  {sfxError && (
+                    <div className="sfx-error">
+                      <AlertCircle size={15} />
+                      {sfxError}
+                    </div>
+                  )}
+
+                  <div className="sfx-default-controls">
+                    <div>
+                      <label className="editor-label">Default start time</label>
+                      <input
+                        className="editor-select sfx-time-input"
+                        type="text"
+                        placeholder="00:12.500"
+                        value={newSfxTime}
+                        onChange={(event) => setNewSfxTime(event.target.value)}
+                      />
+                    </div>
+
+                    <div>
+                      <div className="editor-range-header">
+                        <label>Default volume</label>
+                        <strong>{Math.round(newSfxVolume * 100)}%</strong>
+                      </div>
+                      <input
+                        className="editor-range"
+                        type="range"
+                        min="0"
+                        max="1"
+                        step="0.05"
+                        value={newSfxVolume}
+                        onChange={(event) =>
+                          setNewSfxVolume(Number(event.target.value))
+                        }
+                      />
+                    </div>
+                  </div>
+
+                  {soundEffectTracks.length === 0 ? (
+                    <div className="sfx-empty">
+                      <Activity size={25} />
+                      <strong>No sound effects added</strong>
+                      <span>
+                        Upload audio files to build your effects timeline.
+                      </span>
+                    </div>
+                  ) : (
+                    <div className="sfx-track-list">
+                      <div className="sfx-list-heading">
+                        <strong>Added effects</strong>
+                        <span>{soundEffectTracks.length} tracks</span>
+                      </div>
+                      {soundEffectTracks.map((track, index) => (
+                        <div className="sfx-track-card" key={track.id}>
+                          <div className="sfx-track-top">
+                            <div className="sfx-track-file">
+                              <span className="sfx-track-index">
+                                {String(index + 1).padStart(2, "0")}
+                              </span>
+                              <div>
+                                <strong title={track.name}>{track.name}</strong>
+                                <small>Audio effect</small>
+                              </div>
+                            </div>
+
+                            <button
+                              type="button"
+                              className="sfx-remove-button"
+                              onClick={() => removeSoundEffect(track.id)}
+                              title="Remove effect"
+                            >
+                              <Trash2 size={17} />
+                            </button>
+                          </div>
+
+                          <audio
+                            className="sfx-audio-preview"
+                            src={track.url}
+                            controls
+                            preload="metadata"
+                          />
+                          <label className="visual-impact-track-toggle">
+                            <span>
+                              <strong>Flash / Visual Impact</strong>
+                              <small>
+                                Enable or disable the flash for this sound
+                                effect
+                              </small>
+                            </span>
+
+                            <input
+                              type="checkbox"
+                              checked={Boolean(track.visualImpact)}
+                              onChange={(event) =>
+                                updateSoundEffect(
+                                  track.id,
+                                  "visualImpact",
+                                  event.target.checked,
+                                )
+                              }
+                            />
+                          </label>
+                          <div className="sfx-track-controls">
+                            <div>
+                              <label className="editor-label">Start time</label>
+                              <input
+                                className="editor-select sfx-time-input"
+                                type="text"
+                                value={track.startTime}
+                                placeholder="00:12.500"
+                                onChange={(event) =>
+                                  updateSoundEffect(
+                                    track.id,
+                                    "startTime",
+                                    event.target.value,
+                                  )
+                                }
+                              />
+
+                              {parseSfxTime(track.startTime) === null && (
+                                <small className="sfx-field-error">
+                                  Use MM:SS.mmm format
+                                </small>
+                              )}
+                            </div>
+
+                            <div>
+                              <div className="editor-range-header">
+                                <label>Volume</label>
+                                <strong>
+                                  {Math.round(track.volume * 100)}%
+                                </strong>
+                              </div>
+                              <input
+                                className="editor-range"
+                                type="range"
+                                min="0"
+                                max="1"
+                                step="0.05"
+                                value={track.volume}
+                                onChange={(event) =>
+                                  updateSoundEffect(
+                                    track.id,
+                                    "volume",
+                                    Number(event.target.value),
+                                  )
+                                }
+                              />
+                            </div>
+                          </div>
+                        </div>
+                      ))}
+                      <div className="visual-impact-panel">
+                        <div className="visual-impact-header">
+                          <div className="visual-impact-title">
+                            <span className="visual-impact-icon">
+                              <Zap size={19} />
+                            </span>
+
+                            <div>
+                              <strong>Visual Impact FX</strong>
+                              <small>
+                                Configure flash separately for each sound effect
+                              </small>
+                            </div>
+                          </div>
+
+                          <span className="visual-impact-mode-badge">
+                            PER EFFECT
+                          </span>
+                        </div>
+
+                        <div>
+                          <div className="editor-range-header">
+                            <label>Glow intensity</label>
+                            <strong>
+                              {Math.round(impactIntensity * 100)}%
+                            </strong>
+                          </div>
+
+                          <input
+                            className="editor-range"
+                            type="range"
+                            min="0.2"
+                            max="1"
+                            step="0.05"
+                            value={impactIntensity}
+                            onChange={(event) =>
+                              setImpactIntensity(Number(event.target.value))
+                            }
+                          />
+
+                          <small className="caption-help-text">
+                            Each sound effect can independently trigger the
+                            visual impact.
+                          </small>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+
+            {/* MIXER SUMMARY */}
+            <div className="audio-mixer-summary">
+              <div className="audio-mixer-heading">
+                <Activity size={18} />
+                <strong>Final Audio Mixer</strong>
+              </div>
+
+              <div className="audio-mixer-row">
+                <span>Streamer audio</span>
+                <strong className="mixer-active">Independent</strong>
+              </div>
+
+              <div className="audio-mixer-row">
+                <span>Background music</span>
+                <strong
+                  className={bgMusicEnabled ? "mixer-active" : "mixer-muted"}
+                >
+                  {bgMusicEnabled
+                    ? `${Math.round(bgMusicVolume * 100)}%`
+                    : "Disabled"}
+                </strong>
+              </div>
+
+              <div className="audio-mixer-row">
+                <span>Sound effects</span>
+                <strong
+                  className={soundEffects ? "mixer-active" : "mixer-muted"}
+                >
+                  {soundEffects
+                    ? `${soundEffectTracks.length} tracks`
+                    : "Disabled"}
+                </strong>
+              </div>
+
+              <p>
+                All audio layers will be mixed independently in the final video.
+              </p>
+            </div>
+          </div>
+
+          {/* OUTPUT FORMAT */}
           <div className="editor-output-info">
             <div>
               <span>Output resolution</span>
@@ -1470,30 +2160,13 @@ function EditorPage({ clips, setError }) {
               <strong>9:16</strong>
             </div>
           </div>
-
-          <button
-            className="primary-button editor-render-button"
-            onClick={renderVideo}
-            disabled={rendering || !selectedClip}
-          >
-            {rendering ? (
-              <>
-                <RefreshCw size={18} className="spin" />
-                Rendering video...
-              </>
-            ) : (
-              <>
-                <Scissors size={18} />
-                Render YouTube Short
-              </>
-            )}
-          </button>
         </div>
 
+        {/* PREVIEW AND RENDER RESULT - MOVED TO BOTTOM */}
         <div className="editor-preview-panel">
           <div className="editor-section-heading">
             <div>
-              <span className="eyebrow">05 / OUTPUT</span>
+              <span className="eyebrow">06 / OUTPUT</span>
               <h2>Render preview</h2>
             </div>
 
@@ -1512,7 +2185,21 @@ function EditorPage({ clips, setError }) {
                   fontSize: `${previewFontSize}px`,
                   fontWeight: captionBold ? 900 : 500,
                   textAlign: "center",
-                  textShadow: "0 3px 8px rgba(0,0,0,0.9)",
+                  textShadow:
+                    captionShadow === "none"
+                      ? "none"
+                      : captionShadow === "soft"
+                        ? "0 2px 5px rgba(0,0,0,0.65)"
+                        : captionShadow === "strong"
+                          ? "0 4px 10px rgba(0,0,0,0.95)"
+                          : `0 0 5px ${colorPresets[captionColor] || "#FFD700"},
+           0 0 12px ${colorPresets[captionColor] || "#FFD700"},
+           0 0 22px ${colorPresets[captionColor] || "#FFD700"}`,
+                  WebkitTextStroke:
+                    captionOutline === "black_white"
+                      ? "2px #FFFFFF"
+                      : "2px #000000",
+                  paintOrder: "stroke fill",
                   position: "absolute",
                   left: "8px",
                   right: "8px",
@@ -1644,6 +2331,27 @@ function EditorPage({ clips, setError }) {
             </div>
           )}
         </div>
+
+        {/* RENDER BUTTON - AFTER PREVIEW */}
+        <div className="editor-bottom-actions">
+          <button
+            className="primary-button editor-render-button"
+            onClick={renderVideo}
+            disabled={rendering || !selectedClip}
+          >
+            {rendering ? (
+              <>
+                <RefreshCw size={18} className="spin" />
+                Rendering video...
+              </>
+            ) : (
+              <>
+                <Scissors size={18} />
+                Render YouTube Short
+              </>
+            )}
+          </button>
+        </div>
       </div>
     </section>
   );
@@ -1729,7 +2437,33 @@ export default function App() {
       setCollecting(false);
     }
   }
+  async function resetClips() {
+    if (
+      !window.confirm(
+        "Are you sure you want to delete all collected clips? This action cannot be undone.",
+      )
+    ) {
+      return;
+    }
 
+    try {
+      setError("");
+
+      const data = await request(`${API}/clips/reset`, {
+        method: "DELETE",
+      });
+
+      setCollectionSummary(null);
+
+      await loadData(false);
+
+      alert(
+        `Clip list reset successfully. ${data.deleted_clips ?? 0} clips deleted.`,
+      );
+    } catch (error) {
+      setError(error.message || "Could not reset clip list.");
+    }
+  }
   async function updateClipStatus(id, status) {
     try {
       await request(`${API}/clips/${id}/status`, {
@@ -1853,6 +2587,7 @@ export default function App() {
             onStatusChange={updateClipStatus}
             collectionSummary={collectionSummary}
             analytics={analytics}
+            onReset={resetClips}
           />
         ) : (
           <section className="page-content">
@@ -1867,14 +2602,54 @@ export default function App() {
                 <p>Your Twitch clip discovery workspace.</p>
               </div>
 
-              <button
-                className="primary-button"
-                onClick={collectTwitch}
-                disabled={collecting}
-              >
-                <Radio size={16} />
-                {collecting ? "Collecting..." : "Collect Twitch clips"}
-              </button>
+              <div className="page-actions">
+                <button
+                  className="secondary-button"
+                  onClick={async () => {
+                    const confirmed = window.confirm(
+                      "Are you sure you want to delete all collected clips? This action cannot be undone.",
+                    );
+
+                    if (!confirmed) return;
+
+                    try {
+                      const response = await fetch(
+                        "http://127.0.0.1:8000/clips/reset",
+                        {
+                          method: "DELETE",
+                        },
+                      );
+
+                      const data = await response.json();
+
+                      if (!response.ok) {
+                        throw new Error(
+                          data.detail || "Failed to reset clips.",
+                        );
+                      }
+
+                      alert(
+                        `Clip list reset successfully. ${data.deleted_clips} clips deleted.`,
+                      );
+                      window.location.reload();
+                    } catch (error) {
+                      alert(error.message || "Could not reset clip list.");
+                    }
+                  }}
+                >
+                  <Trash2 size={16} />
+                  Reset Clip List
+                </button>
+
+                <button
+                  className="primary-button"
+                  onClick={collectTwitch}
+                  disabled={collecting}
+                >
+                  <Radio size={16} />
+                  {collecting ? "Collecting..." : "Collect Twitch clips"}
+                </button>
+              </div>
             </div>
 
             <div className="overview-grid">
