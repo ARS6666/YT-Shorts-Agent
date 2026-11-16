@@ -131,6 +131,64 @@ def clean_word(value):
     return re.sub(r"[^\w']+", "", str(value)).upper()
 
 
+# ---------------------------------------------------------
+# PROFANITY FILTER
+# ---------------------------------------------------------
+
+PROFANITY_WORDS = {
+    "fuck",
+    "fucking",
+    "fucked",
+    "fucker",
+    "fuckers",
+    "fucks",
+    "motherfucker",
+    "motherfuckers",
+    "shit",
+    "shitty",
+    "bullshit",
+    "bitch",
+    "bitches",
+    "bitchy",
+    "asshole",
+    "assholes",
+    "dick",
+    "dicks",
+    "dickhead",
+    "dickheads",
+    "pussy",
+    "bastard",
+    "bastards",
+    "cunt",
+    "cunts",
+    "whore",
+    "whores",
+    "slut",
+    "sluts",
+    "nigger",
+    "nigga",
+}
+
+PROFANITY_PATTERN = re.compile(
+    r"[A-Za-z0-9']+"
+)
+
+def censor_profanity(text):
+    text = str(text)
+
+    def replace_match(match):
+        word = match.group(0)
+        normalized = word.lower().replace("'", "")
+
+        if normalized in PROFANITY_WORDS:
+            return "*" * len(word)
+
+        return word
+
+    return PROFANITY_PATTERN.sub(replace_match, text)
+
+
+
 def escape_ass_text(value):
     return (
         str(value)
@@ -226,6 +284,7 @@ def resolve_position(position, video_height):
 # ANIMATION
 # ---------------------------------------------------------
 
+
 def get_animation_tags(animation, start, end, intensity, font_size):
     intensity = max(0.5, min(float(intensity), 1.5))
 
@@ -233,28 +292,76 @@ def get_animation_tags(animation, start, end, intensity, font_size):
         return ""
 
     if animation == "pop":
+        scale = int(70 + (intensity * 10))
         return (
-            "{\\fscx75\\fscy75"
-            "\\t(0,100,\\fscx100\\fscy100)}"
-        )
-
-    if animation == "shake":
-        angle = 4 * intensity
-
-        return (
-            f"{{\\frz{-angle:.1f}"
-            f"\\t(0,100,\\frz0)}}"
+            f"{{\\fscx{scale}\\fscy{scale}"
+            f"\\t(0,130,\\fscx100\\fscy100)}}"
         )
 
     if animation == "pop_bounce":
+        peak = int(108 + intensity * 8)
         return (
-            "{\\fscx75\\fscy75"
-            "\\t(0,90,\\fscx112\\fscy112)"
-            "\\t(90,170,\\fscx100\\fscy100)}"
+            "{\\fscx70\\fscy70"
+            f"\\t(0,90,\\fscx{peak}\\fscy{peak})"
+            "\\t(90,180,\\fscx100\\fscy100)}"
+        )
+
+    if animation == "shake":
+        angle = 3.5 * intensity
+        return (
+            f"{{\\frz{-angle:.1f}"
+            f"\\t(0,45,\\frz{angle:.1f})"
+            f"\\t(45,90,\\frz{-angle:.1f})"
+            "\\t(90,140,\\frz0)}"
+        )
+
+    if animation == "elastic":
+        peak = int(118 + intensity * 10)
+        return (
+            "{\\fscx35\\fscy140"
+            f"\\t(0,100,\\fscx{peak}\\fscy{peak})"
+            "\\t(100,180,\\fscx94\\fscy106)"
+            "\\t(180,260,\\fscx103\\fscy97)"
+            "\\t(260,330,\\fscx100\\fscy100)}"
+        )
+
+    if animation == "slide_up":
+        scale = int(92 + intensity * 4)
+        return (
+            f"{{\\fscx{scale}\\fscy{scale}"
+            "\\blur3\\t(0,160,\\fscx100\\fscy100\\blur0)}"
+        )
+
+    if animation == "zoom_in":
+        scale = int(35 + intensity * 15)
+        return (
+            f"{{\\fscx{scale}\\fscy{scale}\\blur2"
+            "\\t(0,180,\\fscx100\\fscy100\\blur0)}"
+        )
+
+    if animation == "tilt":
+        angle = 8 * intensity
+        return (
+            f"{{\\frz{angle:.1f}\\fscx90\\fscy90"
+            "\\t(0,180,\\frz0\\fscx100\\fscy100)}"
+        )
+
+    if animation == "fade_pop":
+        scale = int(65 + intensity * 10)
+        return (
+            f"{{\\alpha&HFF&\\fscx{scale}\\fscy{scale}"
+            "\\t(0,160,\\alpha&H00&\\fscx100\\fscy100)}"
+        )
+
+    if animation == "pulse":
+        peak = int(105 + intensity * 7)
+        return (
+            "{\\fscx95\\fscy95"
+            f"\\t(0,100,\\fscx{peak}\\fscy{peak})"
+            "\\t(100,220,\\fscx100\\fscy100)}"
         )
 
     return ""
-
 
 # ---------------------------------------------------------
 # RESOLVE OUTLINE AND SHADOW
@@ -311,9 +418,15 @@ def generate_ass_subtitles(
     bold=True,
     outline_preset="white_black",
     shadow_preset="strong",
+    glow_intensity=0.8,
 ):
-    words = transcription.get("words", [])
-
+    words = [
+        {
+            **word,
+            "text": censor_profanity(word.get("text", "")),
+        }
+        for word in transcription.get("words", [])
+    ]
     if not words:
         raise ValueError(
             "No word timestamps found in transcription."
@@ -324,14 +437,21 @@ def generate_ass_subtitles(
     if display_mode not in ("word", "phrase"):
         display_mode = "word"
 
-    if animation not in (
+    SUPPORTED_ANIMATIONS = (
         "pop_bounce",
         "pop",
         "shake",
+        "elastic",
+        "slide_up",
+        "zoom_in",
+        "tilt",
+        "fade_pop",
+        "pulse",
         "none",
-    ):
-        animation = "pop_bounce"
+    )
 
+    if animation not in SUPPORTED_ANIMATIONS:
+        animation = "pop_bounce"
     outline_settings = resolve_outline(
         outline_preset,
         color_preset,
@@ -345,6 +465,24 @@ def generate_ass_subtitles(
 
     shadow_width = shadow_settings["shadow"]
     glow_enabled = shadow_settings["glow"]
+    glow_intensity = max(
+        0.0,
+        min(float(glow_intensity), 1.5),
+    )
+
+    glow_alpha = max(
+        25,
+        min(95, int(95 - glow_intensity * 45)),
+    )
+
+    glow_blur = max(
+        1,
+        round(1 + glow_intensity * 4),
+    )
+
+    glow_outline = round(
+        3 + glow_intensity * 6
+    )
 
     bold_value = -1 if bold else 0
 
@@ -478,14 +616,15 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 + caption
             )
 
+ 
             event_start = ass_time(start)
             event_end = ass_time(end + 0.08)
 
-            # Glow layer: a wider, blurred, transparent copy.
+            # Glow layer: configurable colored light behind captions.
             if glow_enabled:
                 glow_color = make_transparent_color(
                     primary_color,
-                    alpha="65",
+                    alpha=f"{glow_alpha:02d}",
                 )
 
                 glow_caption = caption.replace(
@@ -495,12 +634,12 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
                 glow_caption = glow_caption.replace(
                     f"\\bord{outline_width}",
-                    f"\\bord{outline_width + 9}",
+                    f"\\bord{outline_width + glow_outline}",
                 )
 
                 glow_caption = glow_caption.replace(
                     "\\shad0",
-                    "\\shad0\\blur5",
+                    f"\\shad0\\blur{glow_blur}",
                 )
 
                 events.append(
@@ -514,12 +653,14 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             else:
                 normal_layer = 0
 
+            # Always add the normal caption layer.
             events.append(
                 f"Dialogue: {normal_layer},"
                 f"{event_start},"
                 f"{event_end},"
                 f"Default,,0,0,0,,{caption}"
             )
+
 
     if not events:
         raise ValueError(

@@ -14,6 +14,7 @@ from app.collectors.twitch import collect_twitch_clips
 from sqlalchemy import func
 from app.collectors.youtube import collect_youtube_videos
 from app.services.clip_trends import get_trending_clips
+from app.services.live_terminal import terminal, router as terminal_router
 from app.api.editor import router as editor_router
 from app.models.daily_hunt import DailyHunt
 from app.services.daily_hunt import (
@@ -24,6 +25,7 @@ from app.services.daily_hunt import (
     start_daily_hunt_scheduler,
     stop_daily_hunt_scheduler,
 )
+from app.api.youtube_clipper import router as youtube_clipper_router
 from fastapi.middleware.cors import CORSMiddleware
 from app.api.streamers import router as streamers_router
 from app.services.scoring import calculate_viral_score
@@ -31,14 +33,17 @@ from app.services.scoring import calculate_viral_score
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    Base.metadata.create_all(bind=engine)
+    terminal.install()
 
-    start_daily_hunt_scheduler()
+    try:
+        Base.metadata.create_all(bind=engine)
+        start_daily_hunt_scheduler()
 
-    yield
+        yield
 
-    stop_daily_hunt_scheduler()
-
+    finally:
+        stop_daily_hunt_scheduler()
+        terminal.restore()
 app = FastAPI(
     title="TrendHunter AI",
     description="Streamer Clip Discovery and Viral Scoring Engine",
@@ -57,6 +62,8 @@ app.add_middleware(
 )
 app.include_router(streamers_router)
 app.include_router(editor_router)
+app.include_router(youtube_clipper_router)
+app.include_router(terminal_router)
 # -------------------------
 # Request schemas
 # -------------------------

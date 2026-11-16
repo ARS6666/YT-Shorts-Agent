@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Activity,
   LayoutDashboard,
@@ -22,6 +22,7 @@ import {
   Download,
   SlidersHorizontal,
   Zap,
+  FilePlay,
 } from "lucide-react";
 import "./App.css";
 
@@ -747,9 +748,266 @@ function StreamersPage({ streamers, onRefresh, setError }) {
     </section>
   );
 }
+/* ---------------- YOUTUBE CLIPPER ---------------- */
+
+function YouTubeClipperPage({ youtubeClips, onRefresh, onOpenEditor }) {
+  const [url, setUrl] = useState("");
+  const [maxClips, setMaxClips] = useState(8);
+  const [minDuration, setMinDuration] = useState(25);
+  const [maxDuration, setMaxDuration] = useState(55);
+  const [busy, setBusy] = useState(false);
+  const [stage, setStage] = useState("");
+  const [message, setMessage] = useState("");
+  const [videoInfo, setVideoInfo] = useState(null);
+
+  async function extractClips(event) {
+    event.preventDefault();
+    if (!url.trim()) {
+      setMessage("Paste a YouTube video URL first.");
+      return;
+    }
+    if (Number(minDuration) < 5 || Number(maxDuration) < Number(minDuration)) {
+      setMessage("Check the minimum and maximum clip durations.");
+      return;
+    }
+
+    setBusy(true);
+    setMessage("");
+    setVideoInfo(null);
+    try {
+      setStage("Reading YouTube video information...");
+      const info = await request(`${API}/youtube/info`, {
+        method: "POST",
+        body: JSON.stringify({ url: url.trim() }),
+      });
+      console.log("YouTube info response:", info);
+      if (info?.success === false)
+        throw new Error(
+          info.detail || info.message || "Could not read this YouTube video.",
+        );
+      const videoId = info.video?.id || info.id || info.video_id;
+      if (!videoId)
+        throw new Error("The info endpoint did not return a video ID.");
+      setVideoInfo(info);
+
+      setStage("Downloading source video...");
+      await request(`${API}/youtube/download`, {
+        method: "POST",
+        body: JSON.stringify({ url: url.trim() }),
+      });
+
+      setStage("Transcribing video...");
+      await request(
+        `${API}/youtube/transcribe/${encodeURIComponent(videoId)}`,
+        { method: "POST" },
+      );
+
+      setStage("Finding the best moments...");
+      await request(`${API}/youtube/analyze/${encodeURIComponent(videoId)}`, {
+        method: "POST",
+        body: JSON.stringify({
+          max_clips: Number(maxClips),
+          min_duration: Number(minDuration),
+          max_duration: Number(maxDuration),
+        }),
+      });
+
+      setStage("Generating separate Shorts clips...");
+      const generated = await request(
+        `${API}/youtube/generate/${encodeURIComponent(videoId)}`,
+        { method: "POST" },
+      );
+      setStage("");
+      setMessage(
+        generated?.message ||
+          "Extraction completed. Refreshing your generated clips...",
+      );
+      await onRefresh?.();
+    } catch (error) {
+      setStage("");
+      setMessage(error.message || "YouTube clip extraction failed.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <section className="page-content">
+      <div className="page-heading">
+        <div>
+          <span className="eyebrow">
+            <FilePlay size={14} /> YOUTUBE WORKFLOW
+          </span>
+          <h1>
+            YouTube Clipper<span>.</span>
+          </h1>
+          <p>
+            Paste a video URL, detect strong moments, and turn them into
+            individual Shorts clips.
+          </p>
+        </div>
+      </div>
+
+      <form className="youtube-extraction-card" onSubmit={extractClips}>
+        <div className="editor-section-heading">
+          <div>
+            <span className="eyebrow">01 / SOURCE</span>
+            <h2>Extract clips from YouTube</h2>
+          </div>
+        </div>
+        <label className="editor-label" htmlFor="youtube-source-url">
+          YouTube video URL
+        </label>
+        <input
+          id="youtube-source-url"
+          className="editor-select"
+          type="url"
+          placeholder="https://www.youtube.com/watch?v=..."
+          value={url}
+          onChange={(event) => setUrl(event.target.value)}
+          disabled={busy}
+          required
+        />
+        <div className="youtube-options-grid">
+          <label className="editor-label">
+            Number of clips
+            <input
+              className="editor-select"
+              type="number"
+              min="1"
+              max="30"
+              value={maxClips}
+              onChange={(event) => setMaxClips(event.target.value)}
+              disabled={busy}
+            />
+          </label>
+          <label className="editor-label">
+            Minimum duration (sec)
+            <input
+              className="editor-select"
+              type="number"
+              min="5"
+              max="600"
+              value={minDuration}
+              onChange={(event) => setMinDuration(event.target.value)}
+              disabled={busy}
+            />
+          </label>
+          <label className="editor-label">
+            Maximum duration (sec)
+            <input
+              className="editor-select"
+              type="number"
+              min="5"
+              max="600"
+              value={maxDuration}
+              onChange={(event) => setMaxDuration(event.target.value)}
+              disabled={busy}
+            />
+          </label>
+        </div>
+        <div className="page-actions">
+          <button className="primary-button" type="submit" disabled={busy}>
+            {busy ? (
+              <>
+                <RefreshCw size={16} className="spin" /> Processing...
+              </>
+            ) : (
+              <>
+                <Scissors size={16} /> Find and generate clips
+              </>
+            )}
+          </button>
+        </div>
+        {(stage || message) && (
+          <div className="collection-summary" role="status">
+            {busy && <RefreshCw size={16} className="spin" />}
+            <span>{stage || message}</span>
+          </div>
+        )}
+        {videoInfo && (
+          <div className="editor-source-card">
+            {videoInfo.thumbnail && (
+              <img
+                src={videoInfo.thumbnail}
+                alt={videoInfo.title || "YouTube video"}
+              />
+            )}
+            <div>
+              <strong>{videoInfo.title || "YouTube source video"}</strong>
+              <span>
+                {videoInfo.channel || videoInfo.uploader || "YouTube"}
+              </span>
+            </div>
+          </div>
+        )}
+      </form>
+
+      <div className="editor-section-heading" style={{ marginTop: 28 }}>
+        <div>
+          <span className="eyebrow">02 / GENERATED</span>
+          <h2>Extracted clips ({youtubeClips.length})</h2>
+        </div>
+        <div className="page-actions">
+          <button
+            className="secondary-button"
+            type="button"
+            onClick={onRefresh}
+          >
+            <RefreshCw size={15} /> Refresh
+          </button>
+          <button
+            className="primary-button"
+            type="button"
+            onClick={onOpenEditor}
+            disabled={!youtubeClips.length}
+          >
+            <Scissors size={15} /> Open editor
+          </button>
+        </div>
+      </div>
+
+      {youtubeClips.length === 0 ? (
+        <div className="empty-library">
+          <FilePlay size={30} />
+          <strong>No YouTube clips generated yet</strong>
+          <span>Generated clips will appear here after extraction.</span>
+        </div>
+      ) : (
+        <div className="youtube-generated-list">
+          {youtubeClips.map((clip) => (
+            <div
+              className="editor-source-card"
+              key={clip.youtube_clip_id || `${clip.video_id}-${clip.filename}`}
+            >
+              {clip.thumbnail_url || clip.thumbnail ? (
+                <img
+                  src={clip.thumbnail_url || clip.thumbnail}
+                  alt={clip.title || "YouTube clip"}
+                />
+              ) : (
+                <div className="editor-source-placeholder">
+                  <Clapperboard size={24} />
+                </div>
+              )}
+              <div>
+                <strong>
+                  {clip.title || clip.filename || "Generated YouTube clip"}
+                </strong>
+                <span>{clip.video_id || "YouTube"}</span>
+                <small>{Number(clip.duration || 0).toFixed(0)} sec</small>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
 /* ---------------- SMART CLIP EDITOR ---------------- */
 
-function EditorPage({ clips, setError }) {
+function EditorPage({ clips, youtubeClips = [], setError }) {
   const [selectedClipId, setSelectedClipId] = useState("");
   const [cropMode, setCropMode] = useState("auto");
   const [zoom, setZoom] = useState(1);
@@ -779,6 +1037,7 @@ function EditorPage({ clips, setError }) {
   const [captionColor, setCaptionColor] = useState("mrbeast");
   const [captionOutline, setCaptionOutline] = useState("white_black");
   const [captionShadow, setCaptionShadow] = useState("strong");
+  const [captionGlowIntensity, setCaptionGlowIntensity] = useState(0.8);
 
   // Background Music
   const [bgMusicEnabled, setBgMusicEnabled] = useState(true);
@@ -821,24 +1080,37 @@ function EditorPage({ clips, setError }) {
     Math.min(34, effectiveCaptionFontSize * 0.25),
   );
 
-  const twitchClips = useMemo(
-    () =>
-      clips
-        .filter((clip) => clip.platform === "twitch")
-        .sort(
-          (a, b) => Number(b.viral_score || 0) - Number(a.viral_score || 0),
-        ),
-    [clips],
-  );
+  const availableClips = useMemo(() => {
+    const twitch = clips
+      .filter((clip) => clip.platform === "twitch")
+      .map((clip) => ({
+        ...clip,
+        source_type: "twitch",
+        selection_id: `twitch:${clip.id}`,
+      }));
+    const youtube = youtubeClips.map((clip) => ({
+      ...clip,
+      source_type: "youtube",
+      selection_id: `youtube:${clip.youtube_clip_id || `${clip.video_id}/${clip.filename}`}`,
+    }));
+    return [...twitch, ...youtube].sort(
+      (a, b) =>
+        Number(b.viral_score || b.score || 0) -
+        Number(a.viral_score || a.score || 0),
+    );
+  }, [clips, youtubeClips]);
 
   useEffect(() => {
-    if (!selectedClipId && twitchClips.length > 0) {
-      setSelectedClipId(String(twitchClips[0].id));
+    if (
+      !availableClips.some((clip) => clip.selection_id === selectedClipId) &&
+      availableClips.length > 0
+    ) {
+      setSelectedClipId(availableClips[0].selection_id);
     }
-  }, [twitchClips, selectedClipId]);
+  }, [availableClips, selectedClipId]);
 
-  const selectedClip = twitchClips.find(
-    (clip) => String(clip.id) === String(selectedClipId),
+  const selectedClip = availableClips.find(
+    (clip) => clip.selection_id === selectedClipId,
   );
 
   function parseSfxTime(value) {
@@ -945,7 +1217,7 @@ function EditorPage({ clips, setError }) {
   }
   async function renderVideo() {
     if (!selectedClip) {
-      setError("Please select a Twitch clip first.");
+      setError("Please select a clip first.");
       return;
     }
 
@@ -982,7 +1254,15 @@ function EditorPage({ clips, setError }) {
       const data = await request(`${API}/editor/render`, {
         method: "POST",
         body: JSON.stringify({
-          clip_id: Number(selectedClip.id),
+          clip_id:
+            selectedClip.source_type === "twitch"
+              ? Number(selectedClip.id)
+              : null,
+          youtube_clip_id:
+            selectedClip.source_type === "youtube"
+              ? selectedClip.youtube_clip_id ||
+                `${selectedClip.video_id}/${selectedClip.filename}`
+              : null,
 
           crop_mode: cropMode,
           zoom: Number(zoom),
@@ -1006,6 +1286,7 @@ function EditorPage({ clips, setError }) {
           caption_color: captionColor,
           caption_outline: captionOutline,
           caption_shadow: captionShadow,
+          caption_glow_intensity: Number(captionGlowIntensity),
 
           gta_gameplay_data: gtaGameplayData,
           gta_gameplay_file_name: gtaGameplayFile?.name || null,
@@ -1067,7 +1348,7 @@ function EditorPage({ clips, setError }) {
             </div>
           </div>
 
-          <label className="editor-label">Twitch clip</label>
+          <label className="editor-label">Video source</label>
 
           <select
             className="editor-select"
@@ -1078,12 +1359,24 @@ function EditorPage({ clips, setError }) {
             }}
           >
             <option value="">Choose a clip...</option>
-
-            {twitchClips.map((clip) => (
-              <option key={clip.id} value={clip.id}>
-                #{clip.id} · {(clip.title || "Untitled clip").slice(0, 65)}
-              </option>
-            ))}
+            <optgroup label="Twitch clips">
+              {availableClips
+                .filter((clip) => clip.source_type === "twitch")
+                .map((clip) => (
+                  <option key={clip.selection_id} value={clip.selection_id}>
+                    #{clip.id} · {(clip.title || "Untitled clip").slice(0, 65)}
+                  </option>
+                ))}
+            </optgroup>
+            <optgroup label="YouTube extracted clips">
+              {availableClips
+                .filter((clip) => clip.source_type === "youtube")
+                .map((clip) => (
+                  <option key={clip.selection_id} value={clip.selection_id}>
+                    {clip.title || clip.filename || "Generated YouTube clip"}
+                  </option>
+                ))}
+            </optgroup>
           </select>
 
           {selectedClip && (
@@ -1103,9 +1396,16 @@ function EditorPage({ clips, setError }) {
                 <strong>{selectedClip.title || "Untitled clip"}</strong>
                 <span>{selectedClip.creator || "Unknown creator"}</span>
                 <small>
+                  {selectedClip.source_type === "youtube"
+                    ? "YouTube extracted clip"
+                    : "Twitch clip"}
+                  {" · "}
                   {Number(selectedClip.duration || 0).toFixed(0)} sec
                   {" · "}
-                  Score {Math.round(Number(selectedClip.viral_score || 0))}
+                  Score{" "}
+                  {Math.round(
+                    Number(selectedClip.viral_score || selectedClip.score || 0),
+                  )}
                 </small>
               </div>
             </div>
@@ -1508,11 +1808,16 @@ function EditorPage({ clips, setError }) {
                   >
                     <option value="pop_bounce">Pop + Bounce</option>
                     <option value="pop">Smooth Pop</option>
+                    <option value="elastic">Elastic Bounce</option>
+                    <option value="slide_up">Slide Up</option>
+                    <option value="zoom_in">Zoom In</option>
+                    <option value="tilt">Dynamic Tilt</option>
+                    <option value="fade_pop">Fade + Pop</option>
+                    <option value="pulse">Pulse</option>
                     <option value="shake">Shake</option>
-                    <option value="none">No animation</option>
+                    <option value="none">No Animation</option>
                   </select>
                 </div>
-
                 <div className="editor-range-header">
                   <label>Animation intensity</label>
                   <strong>{Number(animationIntensity).toFixed(1)}x</strong>
@@ -1707,6 +2012,33 @@ function EditorPage({ clips, setError }) {
                 </button>
               ))}
             </div>
+
+            {captionShadow === "glow" && (
+              <div className="caption-control-group">
+                <div className="editor-range-header">
+                  <label>Glow intensity</label>
+                  <strong>
+                    {Math.round((captionGlowIntensity / 1.5) * 100)}%
+                  </strong>
+                </div>
+
+                <input
+                  className="editor-range"
+                  type="range"
+                  min="0"
+                  max="1.5"
+                  step="0.05"
+                  value={captionGlowIntensity}
+                  onChange={(event) =>
+                    setCaptionGlowIntensity(Number(event.target.value))
+                  }
+                />
+
+                <small className="caption-help-text">
+                  Control the strength and spread of the caption glow.
+                </small>
+              </div>
+            )}
           </div>
 
           {/* AUDIO STUDIO - INDEPENDENT FROM SUBTITLES */}
@@ -1761,6 +2093,10 @@ function EditorPage({ clips, setError }) {
                   <option value="bedtime_baby_lullabies">
                     Ts Pmo — Bedtime Baby Lullabies
                   </option>
+                  <option value="Rizz_Song_slowed_Reverb">
+                    Rizz Song slowed Reverb
+                  </option>
+                  <option value="QKThr_Aphex_Twin">QKThr Aphex Twin</option>
                 </select>
 
                 <div className="audio-track-info">
@@ -2178,9 +2514,10 @@ function EditorPage({ clips, setError }) {
               <span className="caption-preview-tag">LIVE STYLE PREVIEW</span>
 
               <div
+                key={captionAnimation}
                 className={`caption-demo-text caption-demo-${captionAnimation}`}
                 style={{
-                  color: colorPresets[captionColor] || "#FFD700",
+                  "--caption-intensity": animationIntensity,
                   fontFamily: "Rubik, sans-serif",
                   fontSize: `${previewFontSize}px`,
                   fontWeight: captionBold ? 900 : 500,
@@ -2192,9 +2529,19 @@ function EditorPage({ clips, setError }) {
                         ? "0 2px 5px rgba(0,0,0,0.65)"
                         : captionShadow === "strong"
                           ? "0 4px 10px rgba(0,0,0,0.95)"
-                          : `0 0 5px ${colorPresets[captionColor] || "#FFD700"},
-           0 0 12px ${colorPresets[captionColor] || "#FFD700"},
-           0 0 22px ${colorPresets[captionColor] || "#FFD700"}`,
+                          : (() => {
+                              const color =
+                                colorPresets[captionColor] || "#FFD700";
+
+                              const intensity = captionGlowIntensity;
+
+                              return [
+                                `0 0 ${Math.round(3 + intensity * 5)}px ${color}`,
+                                `0 0 ${Math.round(7 + intensity * 9)}px ${color}`,
+                                `0 0 ${Math.round(12 + intensity * 14)}px ${color}`,
+                                "0 3px 12px rgba(0,0,0,0.8)",
+                              ].join(", ");
+                            })(),
                   WebkitTextStroke:
                     captionOutline === "black_white"
                       ? "2px #FFFFFF"
@@ -2357,10 +2704,274 @@ function EditorPage({ clips, setError }) {
   );
 }
 
+function BackendTerminal() {
+  const [logs, setLogs] = useState([]);
+  const [status, setStatus] = useState("connecting");
+  const [filter, setFilter] = useState("ALL");
+  const [connectionAttempt, setConnectionAttempt] = useState(0);
+  const [autoScroll, setAutoScroll] = useState(true);
+  const [search, setSearch] = useState("");
+
+  const terminalBodyRef = useRef(null);
+
+  useEffect(() => {
+    let socket;
+    let retryTimer;
+    let active = true;
+
+    function connect() {
+      if (!active) return;
+
+      setStatus("connecting");
+
+      socket = new WebSocket("ws://127.0.0.1:8000/ws/logs");
+
+      socket.onopen = () => {
+        if (active) setStatus("connected");
+      };
+
+      socket.onmessage = (event) => {
+        if (!active) return;
+
+        const message = String(event.data);
+        const upperMessage = message.toUpperCase();
+
+        let level = "INFO";
+
+        if (
+          upperMessage.includes("ERROR") ||
+          upperMessage.includes("EXCEPTION") ||
+          upperMessage.includes("TRACEBACK") ||
+          upperMessage.includes("CRITICAL")
+        ) {
+          level = "ERROR";
+        } else if (
+          upperMessage.includes("WARNING") ||
+          upperMessage.includes("WARN")
+        ) {
+          level = "WARNING";
+        } else if (upperMessage.includes("DEBUG")) {
+          level = "DEBUG";
+        }
+
+        setLogs((current) => [
+          ...current.slice(-499),
+          {
+            id: `${Date.now()}-${Math.random()}`,
+            message,
+            level,
+            time: new Date().toLocaleTimeString(),
+          },
+        ]);
+      };
+
+      socket.onerror = () => {
+        socket?.close();
+      };
+
+      socket.onclose = () => {
+        if (!active) return;
+
+        setStatus("disconnected");
+
+        retryTimer = setTimeout(() => {
+          connect();
+        }, 3000);
+      };
+    }
+
+    connect();
+
+    return () => {
+      active = false;
+      clearTimeout(retryTimer);
+      socket?.close();
+    };
+  }, [connectionAttempt]);
+
+  useEffect(() => {
+    if (autoScroll && terminalBodyRef.current) {
+      terminalBodyRef.current.scrollTop = terminalBodyRef.current.scrollHeight;
+    }
+  }, [logs, autoScroll]);
+
+  const filteredLogs = logs.filter((log) => {
+    const matchesLevel = filter === "ALL" || log.level === filter;
+
+    const matchesSearch =
+      !search || log.message.toLowerCase().includes(search.toLowerCase());
+
+    return matchesLevel && matchesSearch;
+  });
+
+  const errorCount = logs.filter((log) => log.level === "ERROR").length;
+
+  const warningCount = logs.filter((log) => log.level === "WARNING").length;
+
+  function reconnect() {
+    setLogs([]);
+    setConnectionAttempt((value) => value + 1);
+  }
+
+  return (
+    <section className="page-content terminal-page">
+      <div className="terminal-heading">
+        <div>
+          <span className="terminal-eyebrow">SYSTEM MONITOR</span>
+          <h2>Backend Terminal</h2>
+          <p>Live output from your TrendHunter backend process.</p>
+        </div>
+
+        <div className={`terminal-connection ${status}`}>
+          <span />
+          {status === "connected"
+            ? "CONNECTED"
+            : status === "connecting"
+              ? "CONNECTING"
+              : "DISCONNECTED"}
+        </div>
+      </div>
+
+      <div className="terminal-stats">
+        <div className="terminal-stat">
+          <span>TOTAL LOGS</span>
+          <strong>{logs.length}</strong>
+        </div>
+
+        <div className="terminal-stat">
+          <span>ERRORS</span>
+          <strong className="error-text">{errorCount}</strong>
+        </div>
+
+        <div className="terminal-stat">
+          <span>WARNINGS</span>
+          <strong className="warning-text">{warningCount}</strong>
+        </div>
+
+        <div className="terminal-stat">
+          <span>CONNECTION</span>
+          <strong
+            className={status === "connected" ? "success-text" : "error-text"}
+          >
+            {status === "connected" ? "Online" : "Offline"}
+          </strong>
+        </div>
+      </div>
+
+      <div className="terminal-window">
+        <div className="terminal-toolbar">
+          <div className="terminal-window-title">
+            <div className="terminal-dots">
+              <i />
+              <i />
+              <i />
+            </div>
+            <span>trendhunter-backend — powershell output</span>
+          </div>
+
+          <div className="terminal-actions">
+            <button
+              type="button"
+              onClick={() => setAutoScroll((value) => !value)}
+              className={
+                autoScroll ? "terminal-action active" : "terminal-action"
+              }
+            >
+              Auto-scroll {autoScroll ? "ON" : "OFF"}
+            </button>
+
+            <button
+              type="button"
+              className="terminal-action"
+              onClick={() => setLogs([])}
+            >
+              <Trash2 size={14} />
+              Clear
+            </button>
+
+            <button
+              type="button"
+              className="terminal-action reconnect"
+              onClick={reconnect}
+            >
+              <RefreshCw size={14} />
+              Reconnect
+            </button>
+          </div>
+        </div>
+
+        <div className="terminal-controls">
+          <div className="terminal-filters">
+            {["ALL", "INFO", "WARNING", "ERROR", "DEBUG"].map((item) => (
+              <button
+                key={item}
+                type="button"
+                className={
+                  filter === item ? `selected ${item.toLowerCase()}` : ""
+                }
+                onClick={() => setFilter(item)}
+              >
+                {item}
+              </button>
+            ))}
+          </div>
+
+          <div className="terminal-search">
+            <Search size={15} />
+            <input
+              value={search}
+              onChange={(event) => setSearch(event.target.value)}
+              placeholder="Search terminal output..."
+            />
+          </div>
+        </div>
+
+        <div className="terminal-body" ref={terminalBodyRef}>
+          {filteredLogs.length === 0 ? (
+            <div className="terminal-empty">
+              {status === "connected"
+                ? "Waiting for backend output..."
+                : "Waiting for backend connection..."}
+            </div>
+          ) : (
+            filteredLogs.map((log) => (
+              <div
+                className={`terminal-line ${log.level.toLowerCase()}`}
+                key={log.id}
+              >
+                <span className="terminal-time">{log.time}</span>
+                <span className="terminal-level">{log.level}</span>
+                <span className="terminal-message">{log.message}</span>
+              </div>
+            ))
+          )}
+        </div>
+
+        <div className="terminal-footer">
+          <span>
+            <i
+              className={
+                status === "connected" ? "footer-online" : "footer-offline"
+              }
+            />
+            {status === "connected"
+              ? "WebSocket stream active"
+              : "Attempting to reconnect..."}
+          </span>
+          <span>
+            {filteredLogs.length} / {logs.length} lines
+          </span>
+        </div>
+      </div>
+    </section>
+  );
+}
+
 /* ---------------- MAIN APP ---------------- */
 
 export default function App() {
   const [clips, setClips] = useState([]);
+  const [youtubeClips, setYoutubeClips] = useState([]);
   const [streamers, setStreamers] = useState([]);
   const [health, setHealth] = useState(false);
   const [loading, setLoading] = useState(true);
@@ -2380,11 +2991,13 @@ export default function App() {
         clipsResponse,
         streamersResponse,
         analyticsResponse,
+        youtubeClipsResponse,
       ] = await Promise.all([
         fetch(`${API}/health`),
         fetch(`${API}/clips?limit=100`),
         fetch(`${API}/streamers`),
         fetch(`${API}/analytics/overview`),
+        fetch(`${API}/youtube/generated-clips`).catch(() => null),
       ]);
 
       setHealth(healthResponse.ok);
@@ -2404,8 +3017,12 @@ export default function App() {
       const clipsData = await clipsResponse.json();
       const streamersData = await streamersResponse.json();
       const analyticsData = await analyticsResponse.json();
+      const youtubeClipsData = youtubeClipsResponse?.ok
+        ? await youtubeClipsResponse.json()
+        : { items: [] };
 
       setClips(getItems(clipsData));
+      setYoutubeClips(getItems(youtubeClipsData));
       setStreamers(getItems(streamersData));
       setAnalytics(analyticsData);
     } catch (error) {
@@ -2492,7 +3109,9 @@ export default function App() {
     { label: "Discover", icon: Compass },
     { label: "Clip library", icon: Clapperboard },
     { label: "Editor", icon: Scissors },
+    { label: "YouTube Clipper", icon: FilePlay },
     { label: "Streamers", icon: Users },
+    { label: "Backend Terminal", icon: Activity },
   ];
 
   return (
@@ -2575,8 +3194,20 @@ export default function App() {
             onRefresh={() => loadData(false)}
             setError={setError}
           />
+        ) : activePage === "Backend Terminal" ? (
+          <BackendTerminal />
+        ) : activePage === "YouTube Clipper" ? (
+          <YouTubeClipperPage
+            youtubeClips={youtubeClips}
+            onRefresh={() => loadData(false)}
+            onOpenEditor={() => setActivePage("Editor")}
+          />
         ) : activePage === "Editor" ? (
-          <EditorPage clips={clips} setError={setError} />
+          <EditorPage
+            clips={clips}
+            youtubeClips={youtubeClips}
+            setError={setError}
+          />
         ) : activePage === "Discover" || activePage === "Clip library" ? (
           <ClipLibrary
             clips={clips}

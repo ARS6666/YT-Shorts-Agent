@@ -61,8 +61,11 @@ class SoundEffectTrack(BaseModel):
 # =========================================================
 
 class RenderRequest(BaseModel):
-    clip_id: int
-
+    clip_id: int | None = None
+    youtube_clip_id: str | None = Field(
+        default=None,
+        max_length=100,
+    )   
     # Video and audio
     zoom: float = Field(default=1.0, ge=1.0, le=1.5)
     volume: float = Field(default=1.0, ge=0.0, le=2.0)
@@ -128,6 +131,12 @@ class RenderRequest(BaseModel):
         pattern="^(none|soft|strong|glow)$",
     )
 
+    caption_glow_intensity: float = Field(
+        default=0.8,
+        ge=0.0,
+        le=1.5,
+    )
+
     caption_position: str = Field(
         default="lower",
         pattern="^(lower|center|upper)$",
@@ -135,7 +144,7 @@ class RenderRequest(BaseModel):
 
     caption_animation: str = Field(
         default="pop_bounce",
-        pattern="^(pop_bounce|pop|shake|none)$",
+        pattern="^(pop_bounce|pop|shake|elastic|slide_up|zoom_in|tilt|fade_pop|pulse|none)$",
     )
 
     animation_intensity: float = Field(
@@ -1247,6 +1256,39 @@ def mux_final_video(
 
     return output_path
 
+YOUTUBE_CLIPS_DIR = BASE_DIR / "data" / "youtube_downloads"
+
+def resolve_youtube_clip(clip_id: str) -> Path:
+    parts = clip_id.split("/", 1)
+
+    if len(parts) != 2:
+        raise HTTPException(400, "Invalid YouTube clip ID.")
+
+    video_id, filename = parts
+
+    if not re.fullmatch(r"[A-Za-z0-9_-]{6,20}", video_id):
+        raise HTTPException(400, "Invalid YouTube video ID.")
+
+    if not re.fullmatch(r"[A-Za-z0-9_-]+\.mp4", filename):
+        raise HTTPException(400, "Invalid YouTube clip filename.")
+
+    base = (YOUTUBE_CLIPS_DIR / video_id / "clips").resolve()
+    path = (base / filename).resolve()
+
+    if (
+        path.parent != base
+        or not path.is_file()
+        or path.stat().st_size < 1024
+    ):
+        print("YOUTUBE CLIP NOT FOUND:", path)
+        raise HTTPException(
+            status_code=404,
+            detail=f"YouTube clip file not found: {path}",
+        )
+
+    print("YOUTUBE CLIP FOUND:", path)
+    return path
+
 # =========================================================
 # RENDER ENDPOINT
 # =========================================================
@@ -1259,29 +1301,50 @@ def render_clip(
 ):
     check_tools()
 
-    clip = (
-        db.query(Clip)
-        .filter(Clip.id == payload.clip_id)
-        .first()
-    )
-
-    if not clip:
-        raise HTTPException(
-            status_code=404,
-            detail="Clip not found.",
-        )
-
-    if clip.platform != "twitch":
+    if bool(payload.clip_id) == bool(payload.youtube_clip_id):
         raise HTTPException(
             status_code=400,
-            detail="Only Twitch clips are supported.",
+            detail="Select exactly one clip source.",
         )
 
-    if not clip.url:
-        raise HTTPException(
-            status_code=400,
-            detail="Clip URL is missing.",
+    print("\n========== RENDER REQUEST DEBUG ==========")
+    print("clip_id:", payload.clip_id)
+    print("youtube_clip_id:", repr(payload.youtube_clip_id))
+    print("subtitles_enabled:", payload.subtitles_enabled)
+    print("==========================================\n")
+
+    clip = None
+    youtube_source = False
+    source_label = ""
+
+    if payload.youtube_clip_id:
+        print("YOUTUBE CLIP ID:", repr(payload.youtube_clip_id))
+        print("YOUTUBE CLIPS DIR:", YOUTUBE_CLIPS_DIR.resolve())
+        print("RESOLVED CLIP PATH:", (
+            YOUTUBE_CLIPS_DIR / payload.youtube_clip_id.split("/", 1)[0]
+            / "clips" / payload.youtube_clip_id.split("/", 1)[-1]
+        ).resolve())
+        source_path = resolve_youtube_clip(payload.youtube_clip_id)
+        youtube_source = True
+        source_label = Path(payload.youtube_clip_id).name
+
+    else:
+        clip = (
+            db.query(Clip)
+            .filter(Clip.id == payload.clip_id)
+            .first()
         )
+
+        if not clip:
+            raise HTTPException(404, "Clip not found.")
+
+        if clip.platform != "twitch":
+            raise HTTPException(400, "Unsupported clip platform.")
+
+        if not clip.url:
+            raise HTTPException(400, "Clip URL is missing.")
+
+        source_label = str(clip.id)
 
     job_id = uuid.uuid4().hex[:12]
 
@@ -1305,16 +1368,17 @@ def render_clip(
         )
 
         # 3. Download original clip
-        source_path = download_clip(
-            clip.url,
-            job_dir,
-        )
+        if not youtube_source:
+            source_path = download_clip(
+                clip.url,
+                job_dir,
+            )
 
         silent_path = job_dir / "vertical_silent.mp4"
 
         output_path = (
             job_dir
-            / f"trendhunter_{clip.id}_{job_id}.mp4"
+            / f"trendhunter_{source_label}_{job_id}.mp4"
         )
 
         # 4. Crop and convert to vertical format
@@ -1347,6 +1411,16 @@ def render_clip(
                 source_path
             )
 
+        print("\n========== TRANSCRIPTION DEBUG ==========")
+        print("TYPE:", type(transcription))
+        print("KEYS:", transcription.keys() if isinstance(transcription, dict) else "NOT DICT")
+        print("WORD COUNT:", len(transcription.get("words", [])))
+
+        for word in transcription.get("words", [])[:10]:
+            print("WORD:", word)
+
+        print("=========================================\n")
+
         # 6. Generate and burn subtitles
         if (
             payload.subtitles_enabled
@@ -1378,6 +1452,7 @@ def render_clip(
                 bold=payload.caption_bold,
                 outline_preset=payload.caption_outline,
                 shadow_preset=payload.caption_shadow,
+                glow_intensity=payload.caption_glow_intensity,
             )
 
             burn_subtitles(
@@ -1435,7 +1510,9 @@ def render_clip(
         # 9. Response
         return {
             "status": "completed",
-            "clip_id": clip.id,
+            "clip_id": clip.id if clip else None,
+            "youtube_clip_id": payload.youtube_clip_id,
+            "source": "youtube" if youtube_source else "twitch",
             "job_id": job_id,
             "filename": output_path.name,
             "download_url": f"/editor/download/{job_id}",
