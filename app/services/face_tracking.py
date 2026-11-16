@@ -2,6 +2,7 @@
 import cv2
 import math
 from pathlib import Path
+from statistics import pstdev
 
 
 BASE_DIR = Path(__file__).resolve().parents[2]
@@ -17,7 +18,6 @@ def smooth_points(points, radius=2):
         return points
 
     smoothed = []
-
     numeric_fields = ("x", "y", "width", "height")
 
     for index, point in enumerate(points):
@@ -37,46 +37,234 @@ def smooth_points(points, radius=2):
     return smoothed
 
 
-def select_face(faces, previous_center=None):
-    if faces is None or len(faces) == 0:
+def build_face_tracks(
+    frames,
+    max_distance=0.16,
+    max_size_ratio=2.2,
+    max_missing=2,
+):
+    """
+    Connects face detections across frames.
+
+    Each track represents one continuously observed face.
+    Faces that suddenly appear in another scene should not
+    replace an already established track.
+    """
+
+    tracks = []
+    next_track_id = 0
+
+    for frame_index, frame_data in enumerate(frames):
+        detections = frame_data["faces"]
+        used_tracks = set()
+
+        possible_matches = []
+
+        for track in tracks:
+            last_observation = track["observations"][-1]
+            missing = frame_index - last_observation["index"] - 1
+
+            if missing > max_missing:
+                continue
+
+            for detection_index, detection in enumerate(detections):
+                previous = last_observation["face"]
+
+                distance = math.hypot(
+                    detection["x"] - previous["x"],
+                    detection["y"] - previous["y"],
+                )
+
+                previous_size = max(
+                    previous["width"] * previous["height"],
+                    0.0001,
+                )
+
+                current_size = max(
+                    detection["width"] * detection["height"],
+                    0.0001,
+                )
+
+                size_ratio = max(
+                    current_size / previous_size,
+                    previous_size / current_size,
+                )
+
+                if distance > max_distance:
+                    continue
+
+                if size_ratio > max_size_ratio:
+                    continue
+
+                score = distance + abs(math.log(size_ratio)) * 0.025
+
+                possible_matches.append(
+                    (score, track, detection_index)
+                )
+
+        possible_matches.sort(key=lambda item: item[0])
+
+        assigned_detections = set()
+
+        for _, track, detection_index in possible_matches:
+            if track["id"] in used_tracks:
+                continue
+
+            if detection_index in assigned_detections:
+                continue
+
+            detection = detections[detection_index]
+
+            track["observations"].append({
+                "index": frame_index,
+                "time": frame_data["time"],
+                "face": detection,
+            })
+
+            used_tracks.add(track["id"])
+            assigned_detections.add(detection_index)
+
+        for detection_index, detection in enumerate(detections):
+            if detection_index in assigned_detections:
+                continue
+
+            tracks.append({
+                "id": next_track_id,
+                "observations": [{
+                    "index": frame_index,
+                    "time": frame_data["time"],
+                    "face": detection,
+                }],
+            })
+
+            next_track_id += 1
+
+    return tracks
+
+
+def score_face_track(track, total_samples):
+    observations = track["observations"]
+
+    if not observations:
+        return 0.0
+
+    count = len(observations)
+
+    first_index = observations[0]["index"]
+    last_index = observations[-1]["index"]
+
+    span = max(1, last_index - first_index + 1)
+
+    coverage = count / max(total_samples, 1)
+    continuity = count / span
+
+    centers_x = [
+        item["face"]["x"]
+        for item in observations
+    ]
+
+    centers_y = [
+        item["face"]["y"]
+        for item in observations
+    ]
+
+    movement_x = pstdev(centers_x) if len(centers_x) > 1 else 0
+    movement_y = pstdev(centers_y) if len(centers_y) > 1 else 0
+
+    movement = math.sqrt(
+        movement_x ** 2 + movement_y ** 2
+    )
+
+    stability = math.exp(-movement * 8)
+
+    average_area = sum(
+        item["face"]["width"] * item["face"]["height"]
+        for item in observations
+    ) / count
+
+    # A small webcam overlay can be more relevant than
+    # a large face inside the game or reaction video.
+    size_preference = 1.0 - min(average_area / 0.20, 1.0)
+
+    score = (
+        coverage * 0.55
+        + continuity * 0.20
+        + stability * 0.20
+        + size_preference * 0.05
+    )
+
+    return score
+
+
+def select_locked_track(
+    tracks,
+    total_samples,
+    min_track_samples=3,
+):
+    valid_tracks = [
+        track
+        for track in tracks
+        if len(track["observations"]) >= min_track_samples
+    ]
+
+    if not valid_tracks:
         return None
 
-    candidates = []
+    return max(
+        valid_tracks,
+        key=lambda track: score_face_track(
+            track,
+            total_samples,
+        ),
+    )
 
-    for face in faces:
-        x, y, width, height = face[:4]
-        confidence = float(face[-1])
 
-        center_x = x + width / 2
-        center_y = y + height / 2
-        area = width * height
+def create_tracking_points(
+    track,
+    frames,
+    max_hold_samples=2,
+):
+    observations = {
+        item["index"]: item
+        for item in track["observations"]
+    }
 
-        candidates.append({
-            "x": center_x,
-            "y": center_y,
-            "left": x,
-            "top": y,
-            "width": width,
-            "height": height,
-            "area": area,
-            "confidence": confidence,
+    first_index = min(observations)
+    last_index = max(observations)
+
+    points = []
+    last_face = None
+    last_seen_index = None
+
+    for index in range(first_index, last_index + 1):
+        frame_time = frames[index]["time"]
+
+        if index in observations:
+            observation = observations[index]
+            last_face = observation["face"]
+            last_seen_index = index
+            confidence = last_face["confidence"]
+
+        elif (
+            last_face is not None
+            and last_seen_index is not None
+            and index - last_seen_index <= max_hold_samples
+        ):
+            confidence = 0.0
+
+        else:
+            continue
+
+        points.append({
+            "time": round(frame_time, 3),
+            "x": last_face["x"],
+            "y": last_face["y"],
+            "width": last_face["width"],
+            "height": last_face["height"],
+            "confidence": round(confidence, 3),
         })
 
-    if previous_center is None:
-        return max(candidates, key=lambda item: item["area"])
-
-    def candidate_score(item):
-        distance = math.hypot(
-            item["x"] - previous_center[0],
-            item["y"] - previous_center[1],
-        )
-
-        return (
-            distance / max(item["area"] ** 0.5, 1)
-            - math.log1p(item["area"]) * 0.15
-        )
-
-    return min(candidates, key=candidate_score)
+    return points
 
 
 def detect_faces_in_video(
@@ -84,14 +272,32 @@ def detect_faces_in_video(
     sample_interval=0.5,
     max_width=960,
     confidence_threshold=0.75,
+    max_tracking_distance=0.16,
+    max_missing_samples=2,
+    min_track_samples=3,
+    target_region=None,
 ):
+    """
+    Detects faces and locks onto the most persistent,
+    spatially stable face track.
+
+    target_region:
+        Optional normalized region (x, y, width, height).
+        Example: (0.65, 0.65, 0.35, 0.35)
+        This restricts face detection to a known webcam area.
+    """
+
     video_path = Path(video_path)
 
     if not video_path.exists():
-        raise FileNotFoundError(f"Video not found: {video_path}")
+        raise FileNotFoundError(
+            f"Video not found: {video_path}"
+        )
 
     if not MODEL_PATH.exists():
-        raise FileNotFoundError(f"YuNet model not found: {MODEL_PATH}")
+        raise FileNotFoundError(
+            f"YuNet model not found: {MODEL_PATH}"
+        )
 
     detector = cv2.FaceDetectorYN.create(
         str(MODEL_PATH),
@@ -108,22 +314,31 @@ def detect_faces_in_video(
         raise RuntimeError("Could not open video.")
 
     fps = capture.get(cv2.CAP_PROP_FPS)
-    total_frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
-    original_width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
-    original_height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    total_frames = int(
+        capture.get(cv2.CAP_PROP_FRAME_COUNT)
+    )
 
-    if fps <= 0 or original_width <= 0 or original_height <= 0:
+    original_width = int(
+        capture.get(cv2.CAP_PROP_FRAME_WIDTH)
+    )
+
+    original_height = int(
+        capture.get(cv2.CAP_PROP_FRAME_HEIGHT)
+    )
+
+    if (
+        fps <= 0
+        or original_width <= 0
+        or original_height <= 0
+    ):
         capture.release()
         raise RuntimeError("Invalid video metadata.")
 
     duration = total_frames / fps
     frame_step = max(1, int(fps * sample_interval))
 
-    points = []
-    previous_center = None
-    previous_bbox = None
+    frames = []
     frame_index = 0
-    detected_count = 0
 
     try:
         while True:
@@ -134,6 +349,7 @@ def detect_faces_in_video(
 
             if frame_index % frame_step == 0:
                 height, width = frame.shape[:2]
+
                 scale = min(1.0, max_width / width)
 
                 if scale < 1.0:
@@ -147,74 +363,109 @@ def detect_faces_in_video(
                 else:
                     resized = frame
 
+                image_height, image_width = resized.shape[:2]
+
                 detector.setInputSize(
-                    (resized.shape[1], resized.shape[0])
+                    (image_width, image_height)
                 )
 
                 _, faces = detector.detect(resized)
-                selected = select_face(faces, previous_center)
+
                 timestamp = frame_index / fps
+                candidates = []
 
-                if selected:
-                    image_width = resized.shape[1]
-                    image_height = resized.shape[0]
+                if faces is not None:
+                    for face in faces:
+                        x, y, face_width, face_height = face[:4]
 
-                    previous_center = (
-                        selected["x"],
-                        selected["y"],
-                    )
-                    previous_bbox = {
-                        "width": selected["width"] / image_width,
-                        "height": selected["height"] / image_height,
-                    }
+                        center_x = x + face_width / 2
+                        center_y = y + face_height / 2
 
-                    points.append({
-                        "time": round(timestamp, 3),
-                        "x": clamp(
-                            selected["x"] / image_width, 0.0, 1.0
-                        ),
-                        "y": clamp(
-                            selected["y"] / image_height, 0.0, 1.0
-                        ),
-                        "width": clamp(
-                            selected["width"] / image_width, 0.0, 1.0
-                        ),
-                        "height": clamp(
-                            selected["height"] / image_height, 0.0, 1.0
-                        ),
-                        "confidence": round(
-                            selected["confidence"], 3
-                        ),
-                    })
+                        normalized_x = center_x / image_width
+                        normalized_y = center_y / image_height
 
-                    detected_count += 1
+                        if target_region is not None:
+                            rx, ry, rw, rh = target_region
 
-                elif previous_center is not None:
-                    image_width = resized.shape[1]
-                    image_height = resized.shape[0]
+                            if not (
+                                rx <= normalized_x <= rx + rw
+                                and ry <= normalized_y <= ry + rh
+                            ):
+                                continue
 
-                    points.append({
-                        "time": round(timestamp, 3),
-                        "x": clamp(
-                            previous_center[0] / image_width, 0.0, 1.0
-                        ),
-                        "y": clamp(
-                            previous_center[1] / image_height, 0.0, 1.0
-                        ),
-                        "width": previous_bbox["width"],
-                        "height": previous_bbox["height"],
-                        "confidence": 0.0,
-                    })
+                        candidates.append({
+                            "x": clamp(normalized_x, 0.0, 1.0),
+                            "y": clamp(normalized_y, 0.0, 1.0),
+                            "width": clamp(
+                                face_width / image_width,
+                                0.0,
+                                1.0,
+                            ),
+                            "height": clamp(
+                                face_height / image_height,
+                                0.0,
+                                1.0,
+                            ),
+                            "confidence": float(face[-1]),
+                        })
+
+                frames.append({
+                    "time": round(timestamp, 3),
+                    "faces": candidates,
+                })
 
             frame_index += 1
 
     finally:
         capture.release()
 
+    if not frames:
+        return {
+            "success": False,
+            "message": "No frames could be sampled.",
+            "duration": round(duration, 2),
+            "video_width": original_width,
+            "video_height": original_height,
+            "fps": round(fps, 2),
+            "detected_samples": 0,
+            "tracking_points": [],
+        }
+
+    tracks = build_face_tracks(
+        frames,
+        max_distance=max_tracking_distance,
+        max_missing=max_missing_samples,
+    )
+
+    locked_track = select_locked_track(
+        tracks,
+        len(frames),
+        min_track_samples=min_track_samples,
+    )
+
+    if locked_track is None:
+        return {
+            "success": False,
+            "message": "No stable face track found.",
+            "duration": round(duration, 2),
+            "video_width": original_width,
+            "video_height": original_height,
+            "fps": round(fps, 2),
+            "detected_samples": 0,
+            "total_samples": len(frames),
+            "tracking_points": [],
+        }
+
+    points = create_tracking_points(
+        locked_track,
+        frames,
+        max_hold_samples=max_missing_samples,
+    )
+
     if not points:
         return {
             "success": False,
-            "message": "No faces detected in the video.",
+            "message": "Could not create tracking points.",
             "duration": round(duration, 2),
             "video_width": original_width,
             "video_height": original_height,
@@ -231,7 +482,12 @@ def detect_faces_in_video(
         "video_width": original_width,
         "video_height": original_height,
         "fps": round(fps, 2),
-        "detected_samples": detected_count,
-        "total_samples": len(points),
+        "detected_samples": len(locked_track["observations"]),
+        "total_samples": len(frames),
+        "selected_track_id": locked_track["id"],
+        "selected_track_score": round(
+            score_face_track(locked_track, len(frames)),
+            3,
+        ),
         "tracking_points": points,
     }
